@@ -1,0 +1,33 @@
+# --- Datos sensibles: NO subir (device info / credenciales / privacidad) ---
+# Capturas de red: contienen MACs de laptop/telefono, handshakes WPA2 y trafico.
+*.pcap
+*.pcapng
+# Logs de ejecucion: pueden contener IPs locales / SSID.
+*.log
+# Imagenes/archivos personales (WhatsApp, etc.)
+WhatsApp*
+*.zip
+*.jpeg
+*.jpg
+*.png
+# Scripts que crean perfiles WiFi con contrasena (si vuelven a existir).
+run_neo.ps1
+*.pfx
+*_secret*
+credentials*
+
+# --- Entornos / caches / temporales ---
+.venv/
+__pycache__/
+*.pyc
+scratchpad/
+
+# --- Repos de terceros clonados (re-clonables, no son trabajo propio) ---
+tools/dji-firmware-tools/
+tools/dji_protocol/
+
+# --- Datos crudos de video (grandes, no versionar) ---
+data/raw/*.mp4
+data/raw/*.mov
+data/raw/*.srt
+Videos/
