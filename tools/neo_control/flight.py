@@ -79,18 +79,24 @@ class Flight:
     def set_mode(self, mode=N.MODE_MANUAL):
         return self.s.send_command(N.mode_frame(self._dseq(), mode))
 
-    def stream(self, secs, sticks=None, mode=False, takeoff_once=False, label=""):
+    def stream(self, secs, sticks=None, mode=False, takeoff_once=False,
+               takeoff_hold=False, label=""):
         """Streamea (opcional) sticks @20Hz + modo @10Hz + autoridad @1Hz durante 'secs'.
-        sticks=None => no envia sticks (fase previa al vuelo). Devuelve ult. ventana RX."""
+        takeoff_once=True: dispara 0x03/0xda UNA vez al inicio.
+        takeoff_hold=True: REPITE 0x03/0xda ~15Hz durante toda la fase (imita el
+                           'mantener presionado' del boton de despegue de la app).
+        sticks=None => no envia sticks. Devuelve ult. ventana RX."""
         if label: print(label, flush=True)
         end = time.time() + secs
-        n_stick = n_auth = n_mode = n_ka = 0.0
+        n_stick = n_auth = n_mode = n_ka = n_tk = 0.0
         fired = not takeoff_once
         last_win = None
         while time.time() < end:
             now = time.time()
             if takeoff_once and not fired:
                 self.takeoff(); fired = True; print("   >>> TAKEOFF (0x03/0xda) enviado", flush=True)
+            if takeoff_hold and now >= n_tk:
+                self.takeoff(); n_tk = now + 0.07     # ~15 Hz = 'hold' del boton
             if mode and now >= n_mode:
                 self.set_mode(); n_mode = now + 0.1
             if sticks and now >= n_stick:
@@ -110,7 +116,8 @@ def main():
     ap.add_argument("--armed-ok", dest="armed_ok", action="store_true",
                     help="2do candado: confirma exterior+supervisado+failsafe")
     ap.add_argument("--settle", type=float, default=3.0)
-    ap.add_argument("--hover", type=float, default=4.0)
+    ap.add_argument("--tkhold", type=float, default=3.0, help="segundos de 'hold' del despegue")
+    ap.add_argument("--hover", type=float, default=3.0)
     ap.add_argument("--land", type=float, default=12.0)
     args = ap.parse_args()
 
@@ -159,8 +166,10 @@ def main():
         print(">>> DESPEGUE en 5 s (Ctrl+C aborta)...", flush=True)
         for i in range(5, 0, -1):
             print("   ", i, flush=True); time.sleep(1.0)
-        wtk = f.stream(args.hover, NEUTRAL, mode=True, takeoff_once=True, label="2) DESPEGUE + HOVER (neutro, modo Manual)")
-        print("   ventana RX t5 tras takeoff+hover:", ("0x%04x" % wtk[0]) if wtk else "?",
+        f.stream(args.tkhold, NEUTRAL, mode=True, takeoff_hold=True,
+                 label="2) DESPEGUE: manteniendo 0x03/0xda ~%.0fs (como el boton)..." % args.tkhold)
+        wtk = f.stream(args.hover, NEUTRAL, mode=True, label="3) HOVER (neutro, modo Manual)")
+        print("   ventana RX t5:", ("0x%04x" % wtk[0]) if wtk else "?",
               "(seq propio ~0x%04x)" % f.s.seq, flush=True)
         print(">>> ATERRIZANDO: throttle-min. Mira descender...", flush=True)
         f.stream(args.land, (1024, 1024, THR_MIN, 1024), label="")
