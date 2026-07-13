@@ -76,23 +76,29 @@ class Flight:
         mb = N.mb_frame(0x02, 0x03, self._dseq(), 0x40, 0x03, 0xda, b"\x05\xff\xff\xff\xff")
         return self.s.send_command(mb)
 
-    def stream(self, secs, sticks, label="", takeoff_once=False):
-        """Streamea sticks @20Hz + autoridad @1Hz durante 'secs'. Devuelve ult. ventana RX."""
+    def set_mode(self, mode=N.MODE_MANUAL):
+        return self.s.send_command(N.mode_frame(self._dseq(), mode))
+
+    def stream(self, secs, sticks=None, mode=False, takeoff_once=False, label=""):
+        """Streamea (opcional) sticks @20Hz + modo @10Hz + autoridad @1Hz durante 'secs'.
+        sticks=None => no envia sticks (fase previa al vuelo). Devuelve ult. ventana RX."""
         if label: print(label, flush=True)
         end = time.time() + secs
-        n_stick = n_auth = 0.0
+        n_stick = n_auth = n_mode = n_ka = 0.0
         fired = not takeoff_once
         last_win = None
         while time.time() < end:
             now = time.time()
             if takeoff_once and not fired:
                 self.takeoff(); fired = True; print("   >>> TAKEOFF (0x03/0xda) enviado", flush=True)
-            if now >= n_stick:
+            if mode and now >= n_mode:
+                self.set_mode(); n_mode = now + 0.1
+            if sticks and now >= n_stick:
                 self.stick(*sticks); n_stick = now + 0.05
             if now >= n_auth:
                 self.authority(0x02); n_auth = now + 1.0
-            if now >= (n_stick - 0.5):     # keepalive del hello ~cada 0.5s
-                self.s.keepalive()
+            if now >= n_ka:                # keepalive del hello ~cada 0.5s
+                self.s.keepalive(); n_ka = now + 0.5
             w = self.s.poll(0.01)
             if w: last_win = w
         return last_win
@@ -134,7 +140,8 @@ def main():
         f.s.send_command(fr); time.sleep(0.03)
 
     if not real:
-        win = f.stream(args.settle + 2.0, NEUTRAL, label="DRY RUN: NEUTRO + autoridad (NO despega)...")
+        f.stream(1.5, mode=True, label="0) fijando MODO MANUAL (0x03/0xf9)...")
+        win = f.stream(args.settle + 2.0, NEUTRAL, mode=True, label="DRY RUN: modo+NEUTRO+autoridad (NO despega)...")
         print("ventana RX final:", "0x%04x" % win[0] if win else "?")
         if base and win:
             print(">>> %s" % ("VENTANA AVANZO (0x%04x->0x%04x): secuencia de vuelo ACEPTADA. Listo para --fly EXTERIOR."
@@ -147,11 +154,14 @@ def main():
     print(" Ctrl+C = ATERRIZAR. Corte real = BOTON del dron.")
     print("!" * 62, flush=True)
     try:
-        f.stream(args.settle, NEUTRAL, label="1) settle: neutro + autoridad")
+        f.stream(1.5, mode=True, label="0) fijando MODO MANUAL (0x03/0xf9)...")
+        f.stream(args.settle, NEUTRAL, mode=True, label="1) settle: modo + neutro + autoridad")
         print(">>> DESPEGUE en 5 s (Ctrl+C aborta)...", flush=True)
         for i in range(5, 0, -1):
             print("   ", i, flush=True); time.sleep(1.0)
-        f.stream(args.hover, NEUTRAL, label="2) DESPEGUE + HOVER (neutro)", takeoff_once=True)
+        wtk = f.stream(args.hover, NEUTRAL, mode=True, takeoff_once=True, label="2) DESPEGUE + HOVER (neutro, modo Manual)")
+        print("   ventana RX t5 tras takeoff+hover:", ("0x%04x" % wtk[0]) if wtk else "?",
+              "(seq propio ~0x%04x)" % f.s.seq, flush=True)
         print(">>> ATERRIZANDO: throttle-min. Mira descender...", flush=True)
         f.stream(args.land, (1024, 1024, THR_MIN, 1024), label="")
         print(">>> Fin. Si sigue en el aire: BOTON del dron o failsafe.", flush=True)

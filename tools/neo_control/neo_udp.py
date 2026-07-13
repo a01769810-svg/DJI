@@ -151,6 +151,8 @@ class Type5Session:
         self.send_start = self.seed             # sube con los ACK del dron
         self.dseq = 0x0001                       # secuencia DUML interna
         self.sock = None
+        self.drone_next = self.seed             # sig. seq que el dron espera (su ventana RX)
+        self.sent = {}                          # cache seq->pkt para retransmision
 
     def open(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -169,14 +171,48 @@ class Type5Session:
             if got: break
         return got
 
+    WINDOW = 48          # cuanto nos permitimos adelantar a la ventana RX del dron
+
+    def _pump(self):
+        """Drena downlink, actualiza la ventana RX del dron y retransmite lo atascado."""
+        for _ in range(12):
+            self.sock.settimeout(0.003)
+            try:
+                d, a = self.sock.recvfrom(4096)
+            except (socket.timeout, BlockingIOError):
+                break
+            if a[0] != DRONE[0]:
+                continue
+            w = drone_type5_recv_window(d)
+            if w:
+                if w[0] > self.send_start:
+                    self.send_start = w[0]
+                self.drone_next = w[1]          # sig. seq que el dron espera
+        # si el dron sigue esperando un seq que ya mandamos, retransmitelo (en orden)
+        gap = (self.seq - self.drone_next) & 0xffff
+        if 0 < gap <= 0x8000 and self.drone_next in self.sent:
+            self.sock.sendto(self.sent[self.drone_next], DRONE)
+
     def send_command(self, mb):
-        """Envia UN comando MB como type-5 con seq/ventanas correctas."""
+        """Envia UN comando MB como type-5, respetando el control de flujo del dron.
+        Bloquea (pace) si nos adelantamos mas de WINDOW a la ventana RX del dron, y
+        retransmite los paquetes no confirmados para no atascar el stream."""
+        # 1) control de flujo: no adelantarse demasiado a lo que el dron ha aceptado
+        t0 = time.time()
+        while ((self.seq - self.drone_next) & 0xffff) > self.WINDOW and (time.time() - t0) < 0.5:
+            self._pump()
+        # 2) construir, cachear y enviar
         send_end = self.seq
         pkt = build_type5(self.session, self.seq, self.send_start, send_end, self.ctr, mb)
+        self.sent[self.seq] = pkt
         self.sock.sendto(pkt, DRONE)
         sent_seq = self.seq
         self.seq = (self.seq + 8) & 0xffff
         self.ctr = (self.ctr + 1) & 0xff
+        # 3) podar cache viejo (deja las ultimas ~256 tramas para retransmision)
+        if len(self.sent) > 256:
+            for k in sorted(self.sent)[:len(self.sent) - 256]:
+                del self.sent[k]
         return sent_seq
 
     def keepalive(self):
@@ -192,6 +228,8 @@ class Type5Session:
         if a[0] != DRONE[0]:
             return None
         w = drone_type5_recv_window(d)
-        if w and w[0] > self.send_start:
-            self.send_start = w[0]      # avanza nuestro send_start con el ACK del dron
+        if w:
+            if w[0] > self.send_start:
+                self.send_start = w[0]  # avanza nuestro send_start con el ACK del dron
+            self.drone_next = w[1]
         return w
