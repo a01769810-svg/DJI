@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+[DEPRECADO — EXP-024] NO USAR. Trata 0x03/0xda como despegue: es FALSO (es Detection).
+  El despegue real es FunctionControl 0x03/0x2a:01 AUTO_FLY. Usa el wrapper viejo
+  (invalidado en EXP-018). Reemplazado por flight.py + neo_udp.py.
+
 FASE 2c (path B, intento 2) - Init completo + autoridad 0x03/0x20 + DESPEGUE.
 
 Reproduce la secuencia de arranque que hace DJI Fly antes de volar (EXP-010):

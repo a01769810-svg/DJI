@@ -127,21 +127,32 @@ def mode_frame(dseq, mode=MODE_MANUAL):
 
 
 # ---------------------------------------------------------------------------
-# Builders del ARMADO/DESPEGUE (EXP-021). Todos VALIDADOS byte a byte contra
-# Quinta/Octava por analysis/validate_arm.py. Frames DUML "bare" (no envueltos):
-# EXP-019 probo que el envoltorio 0x51/0x01 NO es el candado (Quinta despega con
-# 0x03/0xda crudo). Todos sender=0x02 (app).
+# Builders de vuelo. VALIDADOS byte a byte contra Quinta/Octava por
+# analysis/validate_arm.py. Nombres de comando confirmados contra el mapa
+# historico DJI P3 (ctomichael/fpv_live) y cruzados con nuestras capturas.
 # ---------------------------------------------------------------------------
 
+# ============================ DESPEGUE / ATERRIZAJE REAL ====================
+# EXP-024: el despegue del Neo es FunctionControl 0x03/0x2a, NO 0x03/0xda.
+#   Confirmado en nuestras capturas: 0x03/0x2a:01 (AUTO_FLY) aparece SOLO en las 4
+#   sesiones con vuelo real (Quinta/Octava/Cuarta/Tercer), nunca en las de tierra;
+#   el dron responde DN 0x03/0x2a payload=00 (ack). AUTO_LANDING=02 al aterrizar.
+#   VA ENVUELTO en 0x51/0x01 (wrap x1, rcv=0x03).
+AUTO_FLY = 0x01
+AUTO_LANDING = 0x02
+def funcctrl_frame(dseq, action):
+    """0x03/0x2a FunctionControl. payload = <action:1>. snd=0x02 rcv=0x03 attr=0x40.
+    01=AUTO_FLY (DESPEGUE real), 02=AUTO_LANDING (aterrizaje). Enviar ENVUELTO."""
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0x2a, bytes([action & 0xff]))
+
+
+# ============================ SendGpsToFlyc (autoridad/posicion) ============
 def authority_frame(dseq, ts, state=0x02, lat_e6=0, lon_e6=0):
-    """0x03/0x20 — 'autoridad de vuelo'.
-      payload = <state:1> <lat:int32 LE> <lon:int32 LE> <ts:uint32 LE>
-      state=0x02: lat/lon en CERO (autoridad sin referencia de posicion).
-      state=0x03: lat/lon = coordenada del dron en grados*1e6 (NO es firma; EXP-020).
-      ts = contador = timestamp Unix en segundos (Quinta/Octava decodifican a 2026;
-           +1 por envio a 1 Hz). Se usa la hora real al forjar.
-    PRIVACIDAD: lat_e6/lon_e6 nunca se hardcodean ni se registran; se pasan en
-    tiempo de ejecucion (CLI) o se derivan de la telemetria del propio dron."""
+    """0x03/0x20 SendGpsToFlyc (nombre historico P3, confirmado por estructura).
+      payload = <flag:1> <lat:int32 LE ×1e6> <lon:int32 LE ×1e6> <ts:uint32 LE>
+      flag=0x02: lat/lon en CERO (sin referencia). flag=0x03: coordenada real (EXP-020).
+      ts = timestamp Unix en segundos (Quinta/Octava decodifican a 2026).
+    PRIVACIDAD: lat_e6/lon_e6 nunca se hardcodean ni se registran; se pasan en runtime."""
     if state == 0x02:
         lat_e6 = lon_e6 = 0
     body = (bytes([state & 0xff]) + struct.pack("<ii", lat_e6, lon_e6)
@@ -149,80 +160,77 @@ def authority_frame(dseq, ts, state=0x02, lat_e6=0, lon_e6=0):
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0x20, body)
 
 
+# ============================ GET / housekeeping (NO arman) =================
+# EXP-024: estos NO son parte del armado; son consultas/suscripciones del arranque.
+# Se conservan porque la app los manda, pero NO se asume que sean precondicion.
+
 def d7_frame(dseq, counter, init=False):
-    """0x03/0xd7 — heartbeat de control DURANTE el vuelo (empieza tras armar).
-      init=True (1er frame): payload = 01 01 00 00
-      resto:                 payload = 01 04 00 00 + <counter:uint32 LE>
-    attr=0x80. La app lo manda de forma continua; nuestro emisor no lo hacia."""
+    """0x03/0xd7 GetPushFlightRecord (nombre historico P3). Suscripcion/heartbeat de
+    registro de vuelo; la app lo manda continuo. NO es control de vuelo.
+      init=True: payload = 01 01 00 00 ; resto: 01 04 00 00 + <counter:uint32 LE>. attr=0x80."""
     body = b"\x01\x01\x00\x00" if init else b"\x01\x04\x00\x00" + struct.pack("<I", counter & 0xffffffff)
     return mb_frame(0x02, 0x03, dseq, 0x80, 0x03, 0xd7, body)
 
-
-# 0x03/0xf8 — lote de parametros (GET/SUBSCRIBE), NO cripto (EXP-020). El primer
-# lote observado en Quinta/Octava es constante (3 IDs de 4B). rcv=0x03.
+# 0x03/0xf8 GetParamsByHash (historico P3): lote de IDs de parametro, NO cripto (EXP-020).
 F8_FIRST_BATCH = bytes.fromhex("0b163bde0b163bdf0b163be0")
 def f8_frame(dseq, batch=F8_FIRST_BATCH):
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xf8, batch)
 
-
-# Ráfaga de armado que acompaña al 0x03/0xda (observada en Quinta y Octava):
-def arm34_frame(dseq):
-    """0x03/0x34 — payload vacio, rcv=0x03."""
+def get_plane_name_frame(dseq):
+    """0x03/0x34 GetPlaneName (historico P3): consulta, payload vacio. rcv=0x03."""
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0x34, b"")
 
-def arm3c_frame(dseq):
-    """0x03/0x3c — payload vacio, rcv=0x03."""
+def get_fs_action_frame(dseq):
+    """0x03/0x3c GetFsAction (historico P3): consulta de accion failsafe, payload vacio."""
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0x3c, b"")
 
-def arm0d03_frame(dseq):
-    """0x0d/0x03 — payload 00000000, rcv=0x0b (otro modulo)."""
+def frame_0d03(dseq):
+    """0x0d/0x03 — payload 00000000, rcv=0x0b (otro modulo). Housekeeping del arranque."""
     return mb_frame(0x02, 0x0b, dseq, 0x40, 0x0d, 0x03, b"\x00\x00\x00\x00")
 
 
-def takeoff_frame(dseq):
-    """0x03/0xda subtipo 0x05 = INICIAR despegue. payload 05 ffffffff. rcv=0x03.
-    OJO: por si solo NO arma. Es el paso 1 de la maquina de estados de despegue."""
+# ============================ Detection 0x03/0xda (NO es despegue) ==========
+# EXP-024, CORRIGE EXP-019/021/022: 0x03/0xda es Detection (mapa historico P3), NO
+# takeoff. sub 0x05 = SetSwitch + uint32 bitmask; `05ffffffff` = SetSwitch(0xffffffff).
+# Prueba: aparece en Septima (cambio de modos en TIERRA, sin vuelo) y a intervalos
+# fijos de ~30 s = housekeeping periodico, decorrelacionado del despegue.
+# Los subcomandos 0a/07/08/0d son de Detection (proposito exacto sin confirmar), NO
+# una "maquina de estados de armado". Se conservan por si el prep resulta util, pero
+# NO se asume precondicion. El despegue real es funcctrl_frame(AUTO_FLY).
+DETECTION_RECORD_ID = b"2075123072524943360"   # 19B ASCII, fijo en Quinta/Octava
+
+def detection_setswitch_frame(dseq):
+    """0x03/0xda:05 Detection.SetSwitch(0xffffffff). NO despega."""
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda, b"\x05\xff\xff\xff\xff")
 
-
-# --- Maquina de estados REAL del despegue 0x03/0xda (EXP-022, de Quinta/Octava) ---
-# Secuencia observada: 05 (iniciar) -> 0a01 (confirmar) -> 07<fecha+id> -> 08 (commit)
-# -> stream 0d<...> continuo ~1Hz (control en vuelo). Antes solo repetiamos el 05.
-# ID de vuelo de 19 digitos: IDENTICO en Quinta y Octava (2 sesiones/dias) => constante.
-ARM_FLIGHT_ID = b"2075123072524943360"   # 19 bytes ASCII, fijo
-
-def arm_confirm_frame(dseq):
-    """0x03/0xda subtipo 0x0a = confirmar. payload 0a 01."""
+def detection_frame_0a(dseq):
+    """0x03/0xda:0a Detection (subcomando, housekeeping). payload 0a 01."""
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda, b"\x0a\x01")
 
-def arm_datetime_frame(dseq, year, month, day, hour, minute, second):
-    """0x03/0xda subtipo 0x07 = fecha/hora + ID de vuelo.
-    payload = 07 <year:u16 LE> <mo><day><hr><min><sec> <len=0x13> <ID 19B ASCII>."""
+def detection_frame_07(dseq, year, month, day, hour, minute, second):
+    """0x03/0xda:07 Detection (fecha/hora + record id). Housekeeping, NO despegue."""
     body = (b"\x07" + struct.pack("<H", year)
             + bytes([month & 0xff, day & 0xff, hour & 0xff, minute & 0xff, second & 0xff])
-            + bytes([len(ARM_FLIGHT_ID)]) + ARM_FLIGHT_ID)
+            + bytes([len(DETECTION_RECORD_ID)]) + DETECTION_RECORD_ID)
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda, body)
 
-def arm_commit_frame(dseq):
-    """0x03/0xda subtipo 0x08 = COMMIT del despegue (aqui es donde arma de verdad)."""
+def detection_frame_08(dseq):
+    """0x03/0xda:08 Detection (subcomando). NO es 'commit de despegue'."""
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda, b"\x08")
 
-# Plantilla de la cola del stream de control en vuelo 0x03/0xda subtipo 0x0d.
-# payload = 0d <ts:u32 LE incremental> <cola 12B copiada de un frame real>.
-# La cola lleva setpoints/estado; se replica estructuralmente (best-effort).
-FLYCTRL_0D_TAIL = bytes.fromhex("9f010000931d4400f111f5fe")
-def flyctrl_stream_frame(dseq, ts32, tail=FLYCTRL_0D_TAIL):
-    """0x03/0xda subtipo 0x0d = latido de control en vuelo (mantiene el vuelo)."""
+DETECTION_0D_TAIL = bytes.fromhex("9f010000931d4400f111f5fe")
+def detection_stream_0d(dseq, ts32, tail=DETECTION_0D_TAIL):
+    """0x03/0xda:0d Detection (stream de datos, no control de vuelo). Best-effort."""
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda,
                     b"\x0d" + struct.pack("<I", ts32 & 0xffffffff) + tail)
 
 
 # ---------------------------------------------------------------------------
-# CONTENEDOR 0x51/0x01 "transmision transparente" (EXP-023). CORRIGE EXP-019/022:
-# los comandos de armado/commit (0x03/0xda 0a/07/08/0d, 0x03/0xf8, 0x03/0xf9,
-# 0x03/0x34, 0x03/0x3c, 0x0d/0x03, 0x03/0xd7) la app los manda ENVUELTOS aqui, no
-# crudos. Solo la autoridad 0x03/0x20 y el 0x03/0xda:05 van bare. Enviar el commit
-# crudo => el FC lo ignora (cambia modo pero no arma).
+# CONTENEDOR 0x51/0x01 "transmision transparente" (EXP-023). El FC atiende por este
+# canal: el DESPEGUE real 0x03/0x2a (FunctionControl) va ENVUELTO aqui, igual que
+# el modo 0x03/0xf9, params 0x03/0xf8, GETs 0x03/0x34 y 0x03/0x3c, 0x0d/0x03,
+# 0x03/0xd7 y los Detection 0x03/0xda 0a/07/08/0d. Solo van BARE la autoridad
+# 0x03/0x20 y el Detection.SetSwitch 0x03/0xda:05.
 # Validado: reconstruye 4772/4776 (Quinta) y 2152/2156 (Octava) frames envueltos.
 #   outer: snd=0x3b rcv=0xe9 attr=0x00 cmd 0x51/0x01, dseq = contador del canal.
 #   payload = <frame DUML interno completo> + cola(22B).

@@ -96,44 +96,51 @@ def validate(path):
         ctr = struct.unpack("<I", m["payload"][4:8])[0]
         total += 1; ok += check(f"d7_frame(ctr={ctr})", N.d7_frame(m["dseq"], ctr), m["raw"])
 
-    # lote 0x03/0xf8 primer batch
+    # DESPEGUE/ATERRIZAJE REAL: FunctionControl 0x03/0x2a (EXP-024)
+    m = first(0x03, 0x2a, lambda m: m["payload"]==b"\x01")
+    if m:
+        total += 1; ok += check("funcctrl AUTO_FLY (0x2a:01)",
+                                N.funcctrl_frame(m["dseq"], N.AUTO_FLY), m["raw"])
+    m = first(0x03, 0x2a, lambda m: m["payload"]==b"\x02")
+    if m:
+        total += 1; ok += check("funcctrl AUTO_LANDING (0x2a:02)",
+                                N.funcctrl_frame(m["dseq"], N.AUTO_LANDING), m["raw"])
+
+    # lote 0x03/0xf8 GetParamsByHash primer batch
     m = first(0x03, 0xf8, lambda m: m["payload"]==N.F8_FIRST_BATCH)
     if m:
         total += 1; ok += check("f8_frame(1er batch)", N.f8_frame(m["dseq"]), m["raw"])
 
-    # despegue 0x03/0xda: maquina de estados 05 -> 0a01 -> 07<fecha+id> -> 08
+    # GETs de housekeeping: GetPlaneName 0x34, GetFsAction 0x3c
+    m = first(0x03, 0x34, lambda m: len(m["payload"])==0)
+    if m: total += 1; ok += check("get_plane_name (0x34)", N.get_plane_name_frame(m["dseq"]), m["raw"])
+    m = first(0x03, 0x3c, lambda m: len(m["payload"])==0)
+    if m: total += 1; ok += check("get_fs_action (0x3c)", N.get_fs_action_frame(m["dseq"]), m["raw"])
+    m = first(0x0d, 0x03, lambda m: m["payload"]==bytes.fromhex("00000000"))
+    if m: total += 1; ok += check("frame_0d03", N.frame_0d03(m["dseq"]), m["raw"])
+
+    # Detection 0x03/0xda (housekeeping, NO despegue): valida que los builders siguen fieles
     m = first(0x03, 0xda, lambda m: m["payload"]==bytes.fromhex("05ffffffff"))
     if m:
-        total += 1; ok += check("takeoff_frame (05)", N.takeoff_frame(m["dseq"]), m["raw"])
+        total += 1; ok += check("detection SetSwitch (0xda:05)", N.detection_setswitch_frame(m["dseq"]), m["raw"])
     m = first(0x03, 0xda, lambda m: m["payload"]==bytes.fromhex("0a01"))
     if m:
-        total += 1; ok += check("arm_confirm_frame (0a01)", N.arm_confirm_frame(m["dseq"]), m["raw"])
+        total += 1; ok += check("detection 0xda:0a", N.detection_frame_0a(m["dseq"]), m["raw"])
     m = first(0x03, 0xda, lambda m: m["payload"][:1]==b"\x07")
     if m:
         p = m["payload"]
         yr = struct.unpack("<H", p[1:3])[0]; mo,da,ho,mi,se = p[3],p[4],p[5],p[6],p[7]
-        idlen = p[8]; fid = p[9:9+idlen]
-        # el ID debe coincidir con la constante hardcodeada
-        idok = (fid == N.ARM_FLIGHT_ID)
-        total += 1; ok += check(f"arm_datetime_frame (07, id_const={idok})",
-                                N.arm_datetime_frame(m["dseq"], yr, mo, da, ho, mi, se), m["raw"])
+        idok = (p[9:9+p[8]] == N.DETECTION_RECORD_ID)
+        total += 1; ok += check(f"detection 0xda:07 (id_const={idok})",
+                                N.detection_frame_07(m["dseq"], yr, mo, da, ho, mi, se), m["raw"])
     m = first(0x03, 0xda, lambda m: m["payload"]==b"\x08")
     if m:
-        total += 1; ok += check("arm_commit_frame (08)", N.arm_commit_frame(m["dseq"]), m["raw"])
-    # stream de control en vuelo 0x0d: valida estructura (ts + cola) sobre un frame real
+        total += 1; ok += check("detection 0xda:08", N.detection_frame_08(m["dseq"]), m["raw"])
     m = first(0x03, 0xda, lambda m: m["payload"][:1]==b"\x0d" and len(m["payload"])==17)
     if m:
         ts = struct.unpack("<I", m["payload"][1:5])[0]; tail = m["payload"][5:]
-        total += 1; ok += check("flyctrl_stream_frame (0d, cola real)",
-                                N.flyctrl_stream_frame(m["dseq"], ts, tail), m["raw"])
-
-    # rafaga 0x03/0x34, 0x03/0x3c, 0x0d/0x03
-    m = first(0x03, 0x34, lambda m: len(m["payload"])==0)
-    if m: total += 1; ok += check("arm34_frame", N.arm34_frame(m["dseq"]), m["raw"])
-    m = first(0x03, 0x3c, lambda m: len(m["payload"])==0)
-    if m: total += 1; ok += check("arm3c_frame", N.arm3c_frame(m["dseq"]), m["raw"])
-    m = first(0x0d, 0x03, lambda m: m["payload"]==bytes.fromhex("00000000"))
-    if m: total += 1; ok += check("arm0d03_frame", N.arm0d03_frame(m["dseq"]), m["raw"])
+        total += 1; ok += check("detection 0xda:0d (cola real)",
+                                N.detection_stream_0d(m["dseq"], ts, tail), m["raw"])
 
     # 3) contenedor 0x51/0x01: reconstruir los frames EXTERNOS envueltos del uplink
     print("\n-- 3) contenedor 0x51/0x01 (transmision transparente) --")

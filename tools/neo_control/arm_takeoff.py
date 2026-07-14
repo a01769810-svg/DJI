@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+[DEPRECADO — EXP-024] NO USAR. Trata 0x03/0xda 05ffffffff como despegue: es FALSO.
+  0x03/0xda es Detection (housekeeping); el despegue real es FunctionControl
+  0x03/0x2a:01 AUTO_FLY. Ademas usa el wrapper viejo, invalidado en EXP-018.
+  Reemplazado por flight.py + neo_udp.py. Se conserva solo como historia.
+
 FASE 2b (path B) - Inyeccion del comando de DESPEGUE real del DJI Neo.
 
   Comando: DUML cmd_set 0x03 / cmd_id 0xda, payload 05 ffffffff  (EXP-010).

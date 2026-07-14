@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+[DEPRECADO — EXP-024] NO USAR. El "TAKEOFF" aqui es 0x03/0xda (Detection), NO despegue.
+  El despegue real es FunctionControl 0x03/0x2a:01 AUTO_FLY. Wrapper viejo (EXP-018).
+  Reemplazado por flight.py + neo_udp.py.
+
 diag_takeoff.py — Diagnostico: que responde el Neo al comando de despegue.
 
 Abre sesion, init, fija modo Manual, y luego envia el TAKEOFF + stream de hover

@@ -299,6 +299,7 @@ Luego 41 bytes de DUML `0x01/0x0a` (header 11B con seq_num en frame[6:8], canale
 
 
 ### EXP-019 — CAPTURA DE DESPEGUE REAL EN MANUAL: el comando es correcto; el candado es el canal de control firmado por sesion (2026-07-13)
+> **[CORREGIDO EN EXP-024]** — FALSO: `0x03/0xda 05ffffffff` NO es el despegue (es Detection/SetSwitch, housekeeping). El despegue real es FunctionControl `0x03/0x2a:01` AUTO_FLY. Tampoco hay "canal firmado por sesion" (ver EXP-020). Lo unico que se sostiene de aqui: el modo `0x03/0xf9` ejecuta en el FC.
 - Estado: [OBSERVED, DECISIVO] — con el fix de transporte de EXP-018, el **modo** (0x03/0xf9) ejecuta en hardware pero el **despegue no**. El usuario capturo un despegue real en Manual desde DJI Fly ("Octava prueba"): app -> modo Manual -> mantener boton de despegue ~3 s -> hover 5 s -> aterrizaje. Comparado contra "Quinta" (otro despegue real).
 - Herramienta nueva: **`tools/neo_control/analysis/unwrap.py`** — des-envuelve el contenedor 0x51/0x01 y saca el censo/timeline REAL de los frames DUML internos (el censo anterior estaba ciego: solo veia el contenedor exterior). Complementos: `duml_timeline.py`, `duml_events.py`, `raw_dump.py`.
 - **Estructura del contenedor "transmision transparente" 0x51/0x01** (descubierta): `55 len ver crc8 | snd=3b rcv=e9 | dseq2 | attr=00 | 51 01 | <FRAME DUML INTERNO> | cola~21B (0099d4ac02 <ctr4> ffffffff 0182 00..) | crc16`. El frame interno es el comando real, con su propio snd=0x02/rcv=0x03.
@@ -325,6 +326,7 @@ Luego 41 bytes de DUML `0x01/0x0a` (header 11B con seq_num en frame[6:8], canale
 
 
 ### EXP-021 — SECUENCIA DE ARMADO COMPLETA, REPRODUCIDA Y VALIDADA BYTE A BYTE (sin hardware aun) (2026-07-13)
+> **[CORREGIDO EN EXP-024]** — La "secuencia de armado" reproducida (0x03/0xda, 0x03/0xf8, 0x03/0x34, 0x03/0x3c, 0x0d/0x03, 0x03/0xd7) era en realidad **Detection + GETs + suscripciones (housekeeping)**, NO el armado. El despegue (FunctionControl `0x03/0x2a`) nunca se incluyo aqui. Las validaciones byte-a-byte siguen siendo correctas; lo erroneo era la INTERPRETACION de que esto armaba.
 - Estado: [OBSERVED] — todos los builders del armado reconstruyen el trafico real de la app; falta la prueba en dron.
 - Objetivo (fijado por el usuario): reproducir fielmente `HELLO -> reliable-UDP -> init -> 0x03/0xf8 -> 0x03/0x20 var-03 -> 0x03/0xd7 -> modo Manual -> 0x03/0xda -> sticks neutros -> aterrizaje`, validando byte a byte contra Quinta y Octava antes de tocar hardware.
 - **Dos correcciones de EXP-019/020 (via `analysis/unwrap.py`, censo interno des-envuelto):**
@@ -351,6 +353,7 @@ Luego 41 bytes de DUML `0x01/0x0a` (header 11B con seq_num en frame[6:8], canale
 
 
 ### EXP-022 — LA CAUSA REAL DEL "NO ARMA": mandabamos solo el paso 1 de una maquina de estados de despegue de 4 pasos (2026-07-13)
+> **[CORREGIDO EN EXP-024]** — FALSO. La "maquina de estados de despegue" (0x03/0xda 05->0a->07->08->0d) es **Detection**, no despegue. `0x03/0xda:05` = Detection.SetSwitch (aparece en sesiones SIN vuelo, periodico ~30s). El despegue real es FunctionControl `0x03/0x2a:01` AUTO_FLY, que nunca mandamos. Este EXP identifico bien el patron de bytes, pero le atribuyo mal el proposito.
 - Estado: [OBSERVED, DECISIVO] — corrige EXP-020/021 y descarta la teoria del GPS/var-03 como bloqueo.
 - Contexto: en hardware, `flight.py --fly` (var-02) hizo que el **modo Manual SI se ejecutara en el flight controller** (primer comando confirmado a nivel FC, no solo transporte) pero **el despegue NO armo**. Se probo 2 veces, mismo resultado.
 - Refutacion de la teoria del GPS (correccion del asistente): el Neo **vuela en interior con vision system** (el usuario ha grabado su cuarto volando indoors) => el GPS NO es precondicion de armado. Pista falsa, descartada.
@@ -370,6 +373,7 @@ Luego 41 bytes de DUML `0x01/0x0a` (header 11B con seq_num en frame[6:8], canale
 
 
 ### EXP-023 — EL COMMIT VA ENVUELTO EN 0x51/0x01: mandabamos crudos los comandos que arman (2026-07-13)
+> **[MATIZADO EN EXP-024]** — El hallazgo del envoltorio `0x51/0x01` es CORRECTO y sigue vigente: el despegue real (FunctionControl `0x03/0x2a`) tambien va envuelto ahi. Pero los frames que aqui se llamaban "de armado/commit" (0x03/0xda) eran Detection, no el despegue. El wrapper era necesario pero se aplicaba al comando equivocado.
 - Estado: [OBSERVED, DECISIVO] — corrige EXP-019 ("el envoltorio no es candado") y completa EXP-022.
 - Pista de hardware: `flight.py --fly` (ya con la maquina de estados 05->0a01->07->08, EXP-022) en EXTERIOR: **el modo cambia pero NO arma**, y la **ventana RX type-5 del dron queda congelada en el seed 0x7268** mientras nuestro seq corre a ~0x7790. El dron no consume nuestros comandos de armado.
 - **Hallazgo (clasificacion BARE vs WRAP del uplink en Quinta y Octava):**
@@ -380,3 +384,40 @@ Luego 41 bytes de DUML `0x01/0x0a` (header 11B con seq_num en frame[6:8], canale
 - **VALIDACION:** nuevo builder `neo_udp.wrap_5101`. `validate_arm.py` reconstruye **Quinta 4772/4776** y **Octava 2152/2156** frames envueltos byte a byte (los ~4 fallos por captura son frames con `0x55` anidado en su payload, irrelevantes). Total: **16/16 comprobaciones OK en ambas**.
 - **Cambio de codigo:** `flight.py` ahora envuelve en `0x51/0x01` (con `_wrapped()` y contador `wdseq`) el modo, `0x03/0xf8`, la rafaga, la confirmacion/07/commit, el stream `0d` y el heartbeat `0x03/0xd7`; deja bare la autoridad y el `05`. Test offline: CRCs OK, envoltura correcta por comando.
 - **Siguiente (EXTERIOR, supervisado; lo teclea el usuario):** reintentar `flight.py --fly --armed-ok`. Si ahora la ventana RX **avanza** durante el armado y el dron arma/despega => el envoltorio era la pieza que faltaba. Si sigue sin armar pese a avanzar la ventana, el sospechoso pasa a los lotes `0x03/0xf8` completos a rcv=0x17 y/o el stream `0x51/0x13`.
+
+
+### EXP-024 — EL DESPEGUE REAL ES FunctionControl 0x03/0x2a AUTO_FLY, no 0x03/0xda (2026-07-13)
+- Estado: [CONFIRMED NEO] — corrige EXP-019/021/022. Cross-check del codigo historico DJI P3 (ctomichael/fpv_live) contra Quinta/Octava + todas las capturas.
+- Disparador: `flight.py` seguia sin despegar aun con la maquina de estados 0x03/0xda envuelta (EXP-023). El usuario aporto el mapa historico P3, donde `0x03/0xda`=`Detection` (sub 05=`SetSwitch`+uint32) y `0x03/0x2a`=`FunctionControl` (01=AUTO_FLY, 02=AUTO_LANDING, 07=START_MOTOR, 08=STOP_MOTOR, 22=PRECISION_TAKE_OFF).
+- Herramienta: **`analysis/func_control_probe.py`** — escaneo DUML RECURSIVO (bare + envuelto + anidado, up + down, cualquier profundidad) buscando 0x03/0x2a y reconstruyendo el timeline del despegue.
+- **PRUEBA CAUSAL (nuestras propias capturas):**
+  - **`0x03/0x2a:01` AUTO_FLY (envuelto en 0x51/0x01, rcv=0x03) aparece SOLO en las 4 sesiones con vuelo real** — Quinta (t+21.4), Octava (t+19.2), Cuarta (t+40.0), Tercer (t+52.2) — y el dron responde **DN `0x03/0x2a`=00 (ack)**. `0x03/0x2a:02` AUTO_LANDING aparece en la fase de aterrizaje de cada una.
+  - **AUSENTE** en las sesiones sin vuelo: Primera, Segunda, **Septima** (cambio de modos en tierra), Sexta (nuestra).
+  - **`0x03/0xda:05` esta DECORRELACIONADO del despegue:** aparece en Septima (SIN vuelo) y a **intervalos fijos de ~30 s** (Quinta t+9.9/39.9/69.9/99.8) = housekeeping periodico de Detection. Su coincidencia temporal con el despegue era eso, coincidencia.
+- **Validacion byte a byte del despegue real:** frame interno AUTO_FLY `550e04660203<dseq>40032a01<crc16>`; en Octava `550e04660203658840032a01df87`, envuelto en `0x51/0x01`. `validate_arm.py` reconstruye AUTO_FLY y AUTO_LANDING identicos en Quinta y Octava. Total: **18/18 comprobaciones OK en ambas** (+ wrapper 4772/4776 y 2152/2156).
+- **Confirmacion del mapa P3 en el Neo** (cada ID cruzado contra el comportamiento medido): `0x20` SendGpsToFlyc (=EXP-020 exacto), `0x2a` FunctionControl, `0x34` GetPlaneName, `0x3c` GetFsAction, `0xd7` GetPushFlightRecord, `0xf8` GetParamsByHash, `0xda` Detection. El Neo reutiliza los command IDs de la generacion P3.
+- **Cambios de codigo (todo validado, sin hardware):**
+  - `neo_udp.py`: nuevo `funcctrl_frame(dseq, action)` con `AUTO_FLY=0x01`/`AUTO_LANDING=0x02`. Los builders de 0x03/0xda renombrados a `detection_*` (SetSwitch/0a/07/08/0d) y marcados housekeeping; `0x34`->`get_plane_name_frame`, `0x3c`->`get_fs_action_frame`, `0x0d/0x03`->`frame_0d03`.
+  - `flight.py`: secuencia nueva **HELLO -> init -> modo Manual (envuelto) -> AUTO_FLY (envuelto) -> hover NEUTRO -> AUTO_LANDING (envuelto)**. Detection/params son ahora **opcionales** (`--detection-prep`), NO se asume precondicion. Ctrl+C = AUTO_LANDING. Se elimino la falsa "arm_sequence"/throttle-min.
+  - Scripts legacy `arm_takeoff.py`/`init_takeoff.py`/`diag_takeoff.py` marcados **[DEPRECADO — EXP-024]**.
+  - Entradas EXP-019/021/022 marcadas con su correccion; EXP-023 (envoltorio) matizado (sigue vigente).
+- **Piezas eliminadas por falsa atribucion:** `0x03/0xda 05ffffffff` como "takeoff"; la "maquina de estados de armado" 05/0a/07/08 como despegue; el `0x0d` como "control de vuelo que mantiene el vuelo"; la idea de que var-03/coordenada o el GPS eran el bloqueo.
+- **[INFERRED, sin probar]** AUTO_FLY llega ~10-30 s despues del prep de Detection en las 4 capturas => el prep/settle *podria* ser precondicion; no demostrado. Por eso `--detection-prep` existe pero esta OFF por defecto.
+- **Siguiente (EXTERIOR, supervisado; lo teclea el usuario):** `flight.py --fly --armed-ok` -> VOLAR. Si AUTO_FLY arma => confirmado end-to-end. Si no, reintentar con `--detection-prep`. No se ejecuta hardware en este EXP.
+
+
+### EXP-025 — EL ENGANCHE DE SESION: el handshake de suscripcion 0x51 es lo que hace que el FC procese nuestros comandos (2026-07-14)
+- Estado: [OBSERVED, DECISIVO] — resuelve el bloqueo de fondo (EXP-017 en adelante): por que el dron aceptaba en transporte pero el flight controller ignoraba AUTO_FLY/modo/todo.
+- Contexto: con transporte OK (EXP-018), envoltorio OK (EXP-023), keepalive OK (fix de sesion viva) y el comando de despegue correcto (EXP-024, `0x03/0x2a:01` AUTO_FLY), el `--fly` seguia sin armar y la ventana se quedaba plana. Se investigo en internet + se uso el dissector autoritativo **`tools/dji-firmware-tools`** (ya clonado): cruzados TODOS nuestros comandos contra el -> estaban bien formados (`0x2a` Function Control 1 byte, `0xda` Detection, `0x20` SendGpsToFlyc, `0x34/0x3c/0xd7/0xf8/0xf9/0x43`...). => el bloqueo NO era la estructura de comandos.
+- El paper "Behind The Wings" + la doc del protocolo: en el WiFi de DJI **no hay muro de autenticacion de comando**; los paquetes bien formados se ejecutan. => el problema tenia que ser de ENGANCHE de sesion, no de cripto.
+- Herramientas nuevas (seguras, sin motores): **`analysis/func_control_probe.py`** (scan DUML recursivo bare+wrapped+anidado, up+dn), **`diag_authority.py`** (¿el FC responde a GETs?), **`osd_reason.py`** (lee el OSD del FC y decodifica `flyc_state` + `start_fail_reason` segun el dissector; offsets: flyc_state@30 mask0x7F, controller_state u32@32, start_fail_reason@38 mask0x7F).
+- **Hallazgo del handshake `0x51` (de las capturas):** el dron se "abre" (sirve OSD, responde GETs) a ~t+9, tras un intercambio en el canal `0x51`:
+  - La app manda, envuelto en `0x51/0x01` (inner snd=0xee rcv=0xe9): `0x51/0x02` (config), `0x51/0x06` y `0x51/0x08` (con el **serial del dron**), y un stream continuo `0x51/0x13` (UUID `2020ee4d-...` + contador @off39). El serial se extrae EN VIVO del downlink `0x51/0x08`/`0x51/0x13` (snd=0xe9). NO se hardcodea (device info).
+  - Nosotros nunca mandabamos `0x51/0x13`/06/08. => el dron nos aceptaba en transporte pero **nunca enganchaba**; solo recibiamos `0x51/0x01 + 0x51/0x13(DN) + 0x07/0x94` y el FC ignoraba todo.
+- **RESULTADO EN HARDWARE (osd_reason.py con el handshake 0x51):** ✅✅✅ **el dron ENGANCHO.** Tras enviar `0x51/02+06+08` con serial en vivo + stream `0x51/13`:
+  - Empezo a pushear telemetria RICA: **OSD General `0x03/0x43` (81 frames)**, actitud `0x23/*`, `0x03/0xd7` (562), video, etc.
+  - **El FC RESPONDE a nuestros GET (`0x34/0x3c`): True** — primera confirmacion de que el flight controller procesa nuestros comandos a nivel aplicacion.
+  - OSD decodificado: **estado `GPS_Atti`, gps_used=True, `start_fail_reason = 0x00 'None/Allow start'` (fail_happened=False)** => **el FC PERMITE arrancar motores; NO hay precondicion bloqueando el armado.**
+- **Conclusion:** AUTO_FLY nunca ejecuto no por el comando ni por una precondicion (el FC dice "allow start"), sino porque la sesion **no estaba enganchada** (faltaba la suscripcion `0x51`). Con el enganche, el FC nos procesa y permite motores. Es la ultima pieza; no es cripto (UUID<->serial), coherente con EXP-020.
+- **Conexion WiFi (gotcha que costo mucho tiempo):** el Neo NO emite su AP en un arranque limpio; solo lo levanta al conectar DJI Fly (telefono). Un solo cliente (telefono fuera). El gate `netsh wlan show networks` da falsos negativos (cache) -> se quito; lo fiable es **re-emitir `netsh wlan connect` cada ~2s hasta obtener IP** (wrapper `scratchpad/run_neo.ps1`).
+- **Siguiente (gated, lo teclea el usuario):** integrar el handshake `0x51` en `flight.py` (extraer serial en vivo -> `0x51/02+06+08` -> stream `0x51/13`) antes del modo/AUTO_FLY. Secuencia: HELLO -> init -> **suscripcion 0x51** -> modo -> AUTO_FLY -> hover -> AUTO_LANDING. Con la sesion enganchada, AUTO_FLY llega a un FC que ya nos procesa y permite motores. Riesgo fisico real -> precauciones de seguridad (area despejada, piso normal/sensor IR, Ctrl+C=AUTO_LANDING, supervisado).
