@@ -268,30 +268,71 @@ def sub13_frame(counter):
     tpl = bytearray(_SUB13_TPL); tpl[_SUB13_CTR_OFF] = counter & 0xff
     return sub_frame(0x13, 0x0074, 0x00, bytes(tpl))
 
+def _scan_frames(buf):
+    """Genera (snd,cset,cid,payload) por cada DUML CRC-valido, recursivo en 0x51/0x01."""
+    i, n = 0, len(buf)
+    while i < n:
+        if buf[i] != 0x55:
+            i += 1; continue
+        if i + 4 > n:
+            break
+        ln = buf[i+1] | ((buf[i+2] & 3) << 8)
+        if ln < 13 or i + ln > n or mb_crc8(buf[i:i+3]) != buf[i+3]:
+            i += 1; continue
+        fr = buf[i:i+ln]
+        payload = fr[11:ln-2]
+        yield fr[4], fr[9], fr[10], payload
+        if fr[9] == 0x51 and fr[10] == 0x01:
+            yield from _scan_frames(payload)
+        i += ln
+
 def find_drone_serial(pkt):
-    """Escanea un paquete UDP crudo (recursivo en 0x51/0x01) por un DN 0x51/0x08 o
-    0x51/0x13 (snd=0xe9) y devuelve el serial del dron (20B) o None."""
-    def scan(buf):
-        i, n = 0, len(buf)
-        while i < n:
-            if buf[i] != 0x55:
-                i += 1; continue
-            if i + 4 > n:
-                break
-            ln = buf[i+1] | ((buf[i+2] & 3) << 8)
-            if ln < 13 or i + ln > n or mb_crc8(buf[i:i+3]) != buf[i+3]:
-                i += 1; continue
-            fr = buf[i:i+ln]
-            snd, cset, cid, payload = fr[4], fr[9], fr[10], fr[11:ln-2]
-            if cset == 0x51 and snd == 0xe9:
-                if cid == 0x08 and len(payload) >= 23: return payload[3:23]
-                if cid == 0x13 and len(payload) >= 24: return payload[4:24]
-            if cset == 0x51 and cid == 0x01:
-                r = scan(payload)
-                if r: return r
-            i += ln
+    """Serial del dron (20B) desde un DN 0x51/0x08 o 0x51/0x13 (snd=0xe9), o None."""
+    for snd, cset, cid, payload in _scan_frames(pkt):
+        if cset == 0x51 and snd == 0xe9:
+            if cid == 0x08 and len(payload) >= 23: return payload[3:23]
+            if cid == 0x13 and len(payload) >= 24: return payload[4:24]
+    return None
+
+
+# --- OSD General 0x03/0x43: estado del FC + motivo de no-arranque (EXP-025) ---
+# Offsets segun el dissector autoritativo (tools/dji-firmware-tools):
+#   @30 flyc_state (mask 0x7F) · @32 controller_state u32 (on_ground 0x02, in_air
+#   0x04, motor_on 0x08, gps_used 0x8000) · @38 start_fail_reason (mask 0x7F).
+FLYC_STATE_ENUM = {
+    0x00:'Manual',0x01:'Atti',0x02:'Atti_CL',0x03:'Atti_Hover',0x04:'Hover',0x05:'GPS_Blake',
+    0x06:'GPS_Atti',0x07:'GPS_CL',0x08:'GPS_HomeLock',0x09:'GPS_HotPoint',0x0a:'AssitedTakeoff',
+    0x0b:'AutoTakeoff',0x0c:'AutoLanding',0x0d:'AttiLanding',0x0e:'NaviGo',0x0f:'GoHome',
+    0x10:'ClickGo',0x11:'Joystick',0x1e:'FPV',0x1f:'SPORT',0x20:'NOVICE',0x21:'FORCE_LANDING',
+}
+START_FAIL_ENUM = {
+    0x00:'None/Allow start',0x01:'Compass error',0x02:'Assistant protected',0x03:'Device lock protect',
+    0x04:'Off radius limit landed',0x05:'IMU need adv-calib',0x06:'IMU SN error',0x07:'Temperature cal not ready',
+    0x08:'Compass calibration in progress',0x09:'Attitude error',0x0a:'Novice mode without gps',
+    0x0b:'Battery cell error',0x0c:'Battery comm error',0x0d:'Battery voltage very low',0x12:'Battery not ready',
+    0x13:'May run simulator',0x14:'Gear pack mode',0x15:'Atti limit',0x16:'Product not activation',
+    0x17:'In fly limit area',0x19:'ESC error',0x1a:'IMU is initing',0x1b:'System upgrade',
+    0x1c:'Have run simulator, please restart',0x1d:'IMU cali in progress',0x1e:'Too large tilt on auto takeoff',
+    0x29:'SN invalid',0x2d:'GPS disconnect',0x2e:'Out of whitelist area',0x43:'Aircraft Type Mismatch',
+}
+
+def decode_osd_general(pl):
+    """Decodifica el payload de OSD General (0x03/0x43). Devuelve dict o None si corto."""
+    if len(pl) < 39:
         return None
-    return scan(pkt)
+    cs = struct.unpack_from("<I", pl, 32)[0]
+    return dict(flyc_state=pl[30] & 0x7F,
+                on_ground=bool(cs & 0x02), in_air=bool(cs & 0x04),
+                motor_on=bool(cs & 0x08), gps_used=bool(cs & 0x8000),
+                start_fail_reason=pl[38] & 0x7F, start_fail_happened=bool(pl[38] & 0x80))
+
+def find_osd_general(pkt):
+    """Decodifica el OSD General de un paquete UDP crudo si viene un 0x03/0x43, o None."""
+    for snd, cset, cid, payload in _scan_frames(pkt):
+        if cset == 0x03 and cid == 0x43:
+            d = decode_osd_general(payload)
+            if d: return d
+    return None
 
 
 def parse_header(p):

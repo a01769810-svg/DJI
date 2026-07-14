@@ -114,10 +114,16 @@ class Flight:
         self.wdseq = (self.wdseq + 1) & 0xffffffff
         return r
 
-    # -- BARE (crudos, como la app): sticks, autoridad, iniciar-despegue 05 --
+    # -- BARE (crudos, como la app): sticks, autoridad --
     def stick(self, r, p, th, y):
+        # cola CORREGIDA (EXP-026): ...55 01 04 56 08 <contador u16 LE> 00*6.
+        # El contador (timestamp ms) es lo que faltaba: el FC valida el stream de
+        # control como vivo/monotono; sin el no somos 'controlador activo'.
+        ctr = int(time.time() * 1000) & 0xffff
         mb = N.mb_frame(0x02, 0xa9, self._dseq(), 0x00, 0x01, 0x0a,
-                        b"\x01\x0d\x00" + _V(r, p, th, y) + b"\x40\x00\x02\x00\x00\x06\x55\x01\x04")
+                        b"\x01\x0d\x00" + _V(r, p, th, y)
+                        + b"\x40\x00\x02\x00\x00\x06\x55\x01\x04\x56\x08"
+                        + ctr.to_bytes(2, "little") + b"\x00\x00\x00\x00\x00\x00")
         return self.s.send_command(mb)
 
     def authority(self):
@@ -162,6 +168,38 @@ class Flight:
         """Un frame del stream de suscripcion 0x51/0x13 (mantiene el enganche)."""
         self.sub_ctr = (self.sub_ctr + 1) & 0xff
         return self._wrapped(N.sub13_frame(self.sub_ctr))
+
+    def read_osd(self, secs=2.5):
+        """Lee el OSD del FC (estado + motivo no-arranque) manteniendo el enganche.
+        Devuelve dict o None. None => el FC NO nos esta enviando OSD = NO enganchado."""
+        t0 = last_sub = last_stk = time.time(); osd = None
+        while time.time() - t0 < secs:
+            now = time.time()
+            if self.serial and now - last_sub >= 0.2:
+                self.sub13(); last_sub = now
+            if now - last_stk >= 0.05:                    # sticks NEUTRO vivos (~20Hz)
+                self.stick(*NEUTRAL); last_stk = now
+            self.s.sock.settimeout(0.1)
+            try:
+                d, a = self.s.sock.recvfrom(65535)
+            except (socket.timeout, BlockingIOError):
+                continue
+            if a[0] == N.DRONE[0]:
+                r = N.find_osd_general(d)
+                if r: osd = r
+        return osd
+
+    def report_fc(self, osd):
+        """Imprime el estado real del FC. Devuelve True si esta enganchado (hay OSD)."""
+        if not osd:
+            print(">>> OSD del FC: NO recibido -> el FC NO esta enganchado (no nos procesa).", flush=True)
+            return False
+        st = N.FLYC_STATE_ENUM.get(osd["flyc_state"], "0x%02x?" % osd["flyc_state"])
+        why = N.START_FAIL_ENUM.get(osd["start_fail_reason"], "0x%02x (?)" % osd["start_fail_reason"])
+        print(">>> OSD del FC (enganchado): estado=%s  en_tierra=%s  motores=%s  gps=%s"
+              % (st, osd["on_ground"], osd["motor_on"], osd["gps_used"]), flush=True)
+        print("    MOTIVO NO-ARRANQUE: %s (happened=%s)" % (why, osd["start_fail_happened"]), flush=True)
+        return True
 
     def set_mode(self, mode=N.MODE_MANUAL):
         return self._wrapped(N.mode_frame(self._dseq(), mode))
@@ -282,10 +320,8 @@ def main():
         win = f.stream(args.hover, NEUTRAL, mode=True,
                        label="3) DRY: modo + NEUTRO + autoridad (NO manda AUTO_FLY)...")
         print("ventana RX final:", "0x%04x" % win[0] if win else "?")
-        if base and win:
-            print(">>> %s" % ("VENTANA AVANZO (0x%04x->0x%04x): el dron ACEPTA la secuencia "
-                  "(salvo AUTO_FLY). Listo para --fly (area despejada, piso normal)." % (base[0], win[0])
-                  if win[0] != base[0] else "ventana NO avanzo: revisar transporte."))
+        # verdad del terreno: ¿el FC nos engancho? ¿que reporta?
+        f.report_fc(f.read_osd(2.5))
         s.sock.close(); return
 
     # ---- VUELO REAL ----
@@ -311,10 +347,11 @@ def main():
             print(">>> DESPEGUE en 5 s (Ctrl+C aborta)...", flush=True)
             for i in range(5, 0, -1):
                 print("   ", i, flush=True); time.sleep(1.0)
-        # re-sincroniza el streaming activo (drena downlink, reafirma modo) antes del comando
+        # re-sincroniza y LEE el estado real del FC justo antes de armar
         rw = f.stream(1.0, NEUTRAL, mode=True, label="4) re-sync de sesion antes de AUTO_FLY...")
         print("   ventana RX pre-AUTO_FLY:", ("0x%04x" % rw[0]) if rw else "?", flush=True)
-        print("4) AUTO_FLY (FunctionControl 0x03/0x2a:01, envuelto)...", flush=True)
+        f.report_fc(f.read_osd(2.0))
+        print("5) AUTO_FLY (FunctionControl 0x03/0x2a:01, envuelto)...", flush=True)
         f.auto_fly()
         wtk = f.stream(args.hover, NEUTRAL, mode=True,
                        label="5) HOVER: NEUTRO (modo Manual) + autoridad")
