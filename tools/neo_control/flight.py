@@ -9,8 +9,13 @@ FunctionControl 0x03/0x2a:01 AUTO_FLY, y el aterrizaje 0x03/0x2a:02 AUTO_LANDING
 ambos ENVUELTOS en 0x51/0x01. Confirmado: 0x03/0x2a:01 aparece solo en sesiones con
 vuelo real, con ack DN=00 del dron.
 
+EXP-025: antes del despegue hay que ENGANCHAR la sesion con el handshake de
+suscripcion 0x51 (0x51/02+06+08 con el serial del dron + stream 0x51/13). Sin el,
+el FC ignora todo; con el, el FC nos procesa y reporta motores permitidos.
+
 Secuencia (validada byte a byte por analysis/validate_arm.py contra Quinta/Octava):
-  HELLO -> reliable-UDP -> init (8 frames) -> modo Manual (envuelto) + NEUTRO + autoridad
+  HELLO -> reliable-UDP -> init (8 frames) -> SUSCRIPCION 0x51 (engancha al FC)
+        -> modo Manual (envuelto) + NEUTRO + autoridad [+ stream 0x51/13 continuo]
         -> [--fly] AUTO_FLY (0x03/0x2a:01, envuelto) -> hover NEUTRO
         -> AUTO_LANDING (0x03/0x2a:02, envuelto)
   Opcional --detection-prep: manda el housekeeping Detection/params del arranque
@@ -36,7 +41,7 @@ USO:
   python flight.py --fly --armed-ok                   # VUELO REAL (exterior/supervisado)
   python flight.py --fly --armed-ok --lat .. --lon .. # VUELO REAL con autoridad var-03
 """
-import argparse, sys, time, threading
+import argparse, sys, time, threading, socket
 from datetime import datetime
 import neo_udp as N
 
@@ -93,6 +98,8 @@ class Flight:
         self.hb = 0                       # contador del heartbeat 0x03/0xd7 (opcional)
         self.hb_started = False
         self.wdseq = 1                    # contador del canal 0x51/0x01 (transmision transparente)
+        self.serial = None                # serial del dron (extraido en vivo, NO se hardcodea)
+        self.sub_ctr = 2                  # contador del stream de suscripcion 0x51/0x13
         # autoridad var-03 solo si hay coordenada; si no, var-02
         self.auth_state = 0x03 if (lat is not None and lon is not None) else 0x02
         self.lat_e6 = deg_to_e6(lat) if lat is not None else 0
@@ -129,6 +136,33 @@ class Flight:
         """ATERRIZAJE: FunctionControl 0x03/0x2a:02 AUTO_LANDING, envuelto."""
         return self._wrapped(N.funcctrl_frame(self._dseq(), N.AUTO_LANDING))
 
+    def engage(self, secs=3.0):
+        """SUSCRIPCION 0x51 (EXP-025): escucha el serial del dron en el downlink y
+        manda el handshake 0x51/02+06+08 que ENGANCHA al FC. Sin esto el FC ignora
+        todo. Devuelve True si se envio (serial encontrado)."""
+        t0 = last_ka = time.time()
+        while time.time() - t0 < secs and not self.serial:
+            if time.time() - last_ka >= 0.5:
+                self.s.keepalive(); last_ka = time.time()   # no dejar enfriar la sesion
+            self.s.sock.settimeout(0.15)
+            try:
+                d, a = self.s.sock.recvfrom(65535)
+            except (socket.timeout, BlockingIOError):
+                continue
+            if a[0] == N.DRONE[0]:
+                self.serial = N.find_drone_serial(d)
+        if not self.serial:
+            return False
+        self._wrapped(N.sub02_frame())
+        self._wrapped(N.sub06_frame(self.serial))
+        self._wrapped(N.sub08_frame(self.serial))
+        return True
+
+    def sub13(self):
+        """Un frame del stream de suscripcion 0x51/0x13 (mantiene el enganche)."""
+        self.sub_ctr = (self.sub_ctr + 1) & 0xff
+        return self._wrapped(N.sub13_frame(self.sub_ctr))
+
     def set_mode(self, mode=N.MODE_MANUAL):
         return self._wrapped(N.mode_frame(self._dseq(), mode))
 
@@ -156,16 +190,19 @@ class Flight:
         self.hb = (self.hb + 1) & 0xffffffff
         return r
 
-    def stream(self, secs, sticks=None, mode=False, auth=True, hb=False, label=""):
+    def stream(self, secs, sticks=None, mode=False, auth=True, hb=False, sub=True, label=""):
         """Streamea durante 'secs' varias 'pistas' a su frecuencia observada:
-             sticks 20Hz · modo 10Hz · heartbeat d7 10Hz · autoridad 1Hz · keepalive 2Hz.
+             suscripcion 0x51/13 5Hz · sticks 20Hz · modo 10Hz · d7 10Hz · autoridad 1Hz.
+           sub=True (por defecto) mantiene el ENGANCHE (0x51/13) si ya se hizo engage().
            Devuelve la ultima ventana RX type-5 del dron."""
         if label: print(label, flush=True)
         end = time.time() + secs
-        nt = {"stick": 0.0, "mode": 0.0, "hb": 0.0, "auth": 0.0, "ka": 0.0}
+        nt = {"stick": 0.0, "mode": 0.0, "hb": 0.0, "auth": 0.0, "ka": 0.0, "sub": 0.0}
         last_win = None
         while time.time() < end:
             now = time.time()
+            if sub and self.serial and now >= nt["sub"]:
+                self.sub13(); nt["sub"] = now + 0.2         # ~5 Hz, mantiene el enganche
             if mode and now >= nt["mode"]:
                 self.set_mode(); nt["mode"] = now + 0.1
             if hb and now >= nt["hb"]:
@@ -182,15 +219,18 @@ class Flight:
 
 
 def run_common(f, args):
-    """HELLO ya hecho. init minimo + modo Manual + settle NEUTRO + autoridad.
+    """HELLO ya hecho. init + SUSCRIPCION 0x51 (engancha al FC) + modo + settle NEUTRO.
        Detection prep solo si --detection-prep (EXP-024: no probado como precondicion).
        Comun a DRY y a --fly. NO incluye el despegue (AUTO_FLY)."""
     print("enviando init (%d frames)..." % len(INIT))
     for fr in INIT:
         f.s.send_command(fr); time.sleep(0.03)
-    f.stream(1.5, mode=True, auth=True, label="0) fijando MODO MANUAL + autoridad...")
+    ok = f.engage()
+    print(">>> ENGANCHE 0x51: %s" % ("OK (serial en vivo, FC deberia procesarnos)"
+                                     if ok else "FALLO (no llego el serial del dron)"), flush=True)
+    f.stream(1.5, mode=True, auth=True, label="0) fijando MODO MANUAL + autoridad + suscripcion...")
     f.stream(args.settle, NEUTRAL, mode=True,
-             label="1) settle: modo Manual + NEUTRO + autoridad var-0%d" % f.auth_state)
+             label="1) settle: modo Manual + NEUTRO + autoridad var-0%d + suscripcion" % f.auth_state)
     if getattr(args, "detection_prep", False):
         print("2) Detection prep (0x03/0xf8 + GETs + 0x03/0xda). Opcional; NO despega.", flush=True)
         f.detection_prep()

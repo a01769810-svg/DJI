@@ -242,6 +242,58 @@ def wrap_5101(outer_dseq, inner_frame):
     return mb_frame(0x3b, 0xe9, outer_dseq & 0xffff, 0x00, 0x51, 0x01, inner_frame + tail)
 
 
+# ---------------------------------------------------------------------------
+# SUSCRIPCION 0x51 (EXP-025): ENGANCHA al flight controller. Sin esto el dron
+# acepta en transporte pero el FC ignora todo; con esto el FC procesa nuestros
+# comandos y pushea telemetria. Frames internos snd=0xee rcv=0xe9, se ENVUELVEN
+# en 0x51/0x01. El SERIAL del dron se extrae EN VIVO del downlink (no se hardcodea).
+# Constantes = UUID app (2020ee4d-..., ya en INIT) + protocolo. NO es cripto.
+# ---------------------------------------------------------------------------
+_SUB02 = bytes.fromhex("0504040000000200020000")
+_SUB06_PRE = bytes.fromhex("04020032303230656534642d366163612d343636662d0000001a")
+_SUB06_SUF = bytes.fromhex("0000000000")
+_SUB08_PRE = bytes.fromhex("00001a")
+_SUB08_SUF = bytes.fromhex("00")
+_SUB13_TPL = bytes.fromhex(
+    "0504020032303230656534642d366163612d343636662d0001010100000000000001000001010102000000b0a4180000008b2454000000")
+_SUB13_CTR_OFF = 39
+
+def sub_frame(cid, dseq, attr, payload):
+    return mb_frame(0xee, 0xe9, dseq, attr, 0x51, cid, payload)
+
+def sub02_frame():          return sub_frame(0x02, 0x0072, 0x40, _SUB02)
+def sub06_frame(serial):    return sub_frame(0x06, 0x0074, 0x40, _SUB06_PRE + serial + _SUB06_SUF)
+def sub08_frame(serial):    return sub_frame(0x08, 0x0000, 0xc0, _SUB08_PRE + serial + _SUB08_SUF)
+def sub13_frame(counter):
+    tpl = bytearray(_SUB13_TPL); tpl[_SUB13_CTR_OFF] = counter & 0xff
+    return sub_frame(0x13, 0x0074, 0x00, bytes(tpl))
+
+def find_drone_serial(pkt):
+    """Escanea un paquete UDP crudo (recursivo en 0x51/0x01) por un DN 0x51/0x08 o
+    0x51/0x13 (snd=0xe9) y devuelve el serial del dron (20B) o None."""
+    def scan(buf):
+        i, n = 0, len(buf)
+        while i < n:
+            if buf[i] != 0x55:
+                i += 1; continue
+            if i + 4 > n:
+                break
+            ln = buf[i+1] | ((buf[i+2] & 3) << 8)
+            if ln < 13 or i + ln > n or mb_crc8(buf[i:i+3]) != buf[i+3]:
+                i += 1; continue
+            fr = buf[i:i+ln]
+            snd, cset, cid, payload = fr[4], fr[9], fr[10], fr[11:ln-2]
+            if cset == 0x51 and snd == 0xe9:
+                if cid == 0x08 and len(payload) >= 23: return payload[3:23]
+                if cid == 0x13 and len(payload) >= 24: return payload[4:24]
+            if cset == 0x51 and cid == 0x01:
+                r = scan(payload)
+                if r: return r
+            i += ln
+        return None
+    return scan(pkt)
+
+
 def parse_header(p):
     if len(p) < 8: return None
     x = 0
