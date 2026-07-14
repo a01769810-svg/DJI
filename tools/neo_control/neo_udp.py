@@ -295,10 +295,19 @@ def find_drone_serial(pkt):
     return None
 
 
-# --- OSD General 0x03/0x43: estado del FC + motivo de no-arranque (EXP-025) ---
-# Offsets segun el dissector autoritativo (tools/dji-firmware-tools):
-#   @30 flyc_state (mask 0x7F) · @32 controller_state u32 (on_ground 0x02, in_air
-#   0x04, motor_on 0x08, gps_used 0x8000) · @38 start_fail_reason (mask 0x7F).
+# --- OSD General 0x03/0x43: estado del FC + TELEMETRIA (EXP-025/028) ---
+# Layout completo segun el dissector autoritativo (tools/dji-firmware-tools,
+# flyc_osd_general_dissector). Offsets dentro del payload (tras la cabecera DUML):
+#   @0  longitud (double, rad)      @8  latitud (double, rad)
+#   @16 relative_height  int16 x0.1 m (altura al suelo)
+#   @18/20/22 vgx/vgy/vgz int16 x0.1 m/s (velocidad respecto al suelo)
+#   @24/26/28 pitch/roll/yaw int16 x0.1 grados (actitud)
+#   @30 flyc_state (mask 0x7F)       @31 latest_cmd
+#   @32 controller_state u32: on_ground 0x02, in_air 0x04, motor_on 0x08,
+#       usonic_on 0x10, mvo_used 0x100, batt_req_land 0x400, gps_used 0x8000,
+#       gps_level (0x3C0000 >>18)
+#   @36 gps_nums (satelites)         @38 start_fail (reason 0x7F, happened 0x80)
+#   @40 batt_remain (% restante)     @41 ultrasonic_height x0.1 m
 FLYC_STATE_ENUM = {
     0x00:'Manual',0x01:'Atti',0x02:'Atti_CL',0x03:'Atti_Hover',0x04:'Hover',0x05:'GPS_Blake',
     0x06:'GPS_Atti',0x07:'GPS_CL',0x08:'GPS_HomeLock',0x09:'GPS_HotPoint',0x0a:'AssitedTakeoff',
@@ -317,14 +326,32 @@ START_FAIL_ENUM = {
 }
 
 def decode_osd_general(pl):
-    """Decodifica el payload de OSD General (0x03/0x43). Devuelve dict o None si corto."""
+    """Decodifica el payload de OSD General (0x03/0x43): estado del FC + telemetria
+    (bateria, altura, velocidad, actitud, sensores). Devuelve dict o None si corto.
+    Las claves de estado (flyc_state/on_ground/motor_on/...) se mantienen estables;
+    las de telemetria se agregan si el payload es lo bastante largo."""
     if len(pl) < 39:
         return None
     cs = struct.unpack_from("<I", pl, 32)[0]
-    return dict(flyc_state=pl[30] & 0x7F,
-                on_ground=bool(cs & 0x02), in_air=bool(cs & 0x04),
-                motor_on=bool(cs & 0x08), gps_used=bool(cs & 0x8000),
-                start_fail_reason=pl[38] & 0x7F, start_fail_happened=bool(pl[38] & 0x80))
+    d = dict(
+        flyc_state=pl[30] & 0x7F,
+        on_ground=bool(cs & 0x02), in_air=bool(cs & 0x04),
+        motor_on=bool(cs & 0x08), usonic_on=bool(cs & 0x10),
+        mvo_used=bool(cs & 0x100), batt_req_land=bool(cs & 0x400),
+        gps_used=bool(cs & 0x8000), gps_level=(cs >> 18) & 0xF,
+        start_fail_reason=pl[38] & 0x7F, start_fail_happened=bool(pl[38] & 0x80),
+        height_m=struct.unpack_from("<h", pl, 16)[0] / 10.0,
+        vgx=struct.unpack_from("<h", pl, 18)[0] / 10.0,
+        vgy=struct.unpack_from("<h", pl, 20)[0] / 10.0,
+        vgz=struct.unpack_from("<h", pl, 22)[0] / 10.0,
+        pitch=struct.unpack_from("<h", pl, 24)[0] / 10.0,
+        roll=struct.unpack_from("<h", pl, 26)[0] / 10.0,
+        yaw=struct.unpack_from("<h", pl, 28)[0] / 10.0,
+    )
+    if len(pl) >= 37: d["gps_nums"] = pl[36]
+    if len(pl) >= 41: d["batt_remain"] = pl[40]          # % restante (segun el FC)
+    if len(pl) >= 42: d["ultrasonic_m"] = pl[41] / 10.0
+    return d
 
 def find_osd_general(pkt):
     """Decodifica el OSD General de un paquete UDP crudo si viene un 0x03/0x43, o None."""
@@ -333,6 +360,88 @@ def find_osd_general(pkt):
             d = decode_osd_general(payload)
             if d: return d
     return None
+
+
+# --- Battery Dynamic Data 0x0d/0x02: voltaje/corriente/capacidad/temperatura ---
+# Layout autoritativo (dji-firmware-tools, battery_dynamic_data_dissector), forma
+# comun de 30/31 bytes con 1 byte (index/result) antes del voltaje:
+#   @1 voltage u32 mV · @5 current i32 mA · @9 full_cap u32 mAh
+#   @13 remain u32 mAh · @17 temperature u16 · @19 cell_size · @20 state_of_charge %
+def decode_battery_dynamic(pl):
+    """Decodifica Battery Dynamic Data (0x0d/0x02). Devuelve dict o None si corto.
+    temp: unidades sin confirmar en el Neo (probable 0.1 C); se reporta cruda."""
+    if len(pl) < 21:
+        return None
+    return dict(
+        voltage_mv=struct.unpack_from("<I", pl, 1)[0],
+        current_ma=struct.unpack_from("<i", pl, 5)[0],
+        full_mah=struct.unpack_from("<I", pl, 9)[0],
+        remain_mah=struct.unpack_from("<I", pl, 13)[0],
+        temp_raw=struct.unpack_from("<H", pl, 17)[0],
+        cells=pl[19],
+        soc=pl[20],
+    )
+
+def find_battery_dynamic(pkt):
+    """Battery Dynamic Data (0x0d/0x02) del dron en un paquete UDP crudo, o None."""
+    for snd, cset, cid, payload in _scan_frames(pkt):
+        if cset == 0x0d and cid == 0x02:
+            d = decode_battery_dynamic(payload)
+            if d: return d
+    return None
+
+def scan_duml(pkt):
+    """Publico: itera (snd, cset, cid, payload) de cada DUML CRC-valido (recursivo en
+    0x51/0x01). Para censar en vivo que mensajes empuja el dron."""
+    return _scan_frames(pkt)
+
+
+# --- Gimbal Push Position 0x04/0x05: angulo de la CAMARA (EXP-029) ---
+# Layout autoritativo (dji-firmware-tools, gimbal_params_dissector):
+#   @0 pitch int16 x0.1 grados (0=camara al frente, NEGATIVO=abajo, POSITIVO=arriba;
+#      rango del hardware ~ -90..+47), @2 roll x0.1, @4 yaw x0.1.
+# Verificado contra Quinta/Octava: en reposo pitch=0.0 (camara al frente).
+def decode_gimbal_position(pl):
+    """Decodifica Gimbal Push Position (0x04/0x05). Devuelve dict con el angulo de la
+    camara (gpitch=inclinacion arriba/abajo) o None si corto."""
+    if len(pl) < 6:
+        return None
+    return dict(
+        gpitch=struct.unpack_from("<h", pl, 0)[0] / 10.0,   # inclinacion camara (lo que importa)
+        groll=struct.unpack_from("<h", pl, 2)[0] / 10.0,
+        gyaw=struct.unpack_from("<h", pl, 4)[0] / 10.0,
+    )
+
+def find_gimbal_position(pkt):
+    """Gimbal Push Position (0x04/0x05) del dron en un paquete UDP crudo, o None."""
+    for snd, cset, cid, payload in _scan_frames(pkt):
+        if cset == 0x04 and cid == 0x05:
+            d = decode_gimbal_position(payload)
+            if d: return d
+    return None
+
+
+# --- Gimbal CONTROL: candidatos EXPERIMENTALES (EXP-029) ---
+# 🧪 SIN captura de la app moviendo el gimbal; formatos del dissector autoritativo.
+# Se prueban en tierra (inocuos: solo inclinan la camara, NO vuelan) contra el feedback
+# del Push Position 0x04/0x05. rcv=0x04 (modulo gimbal). Se envian envueltos o bare.
+def gimbal_abs_angle_frame(dseq, pitch10, roll10=0, yaw10=0, flags=0x01, field7=0):
+    """0x04/0x14 Gimbal Abs Angle Control. angle1/2/3 = grados*10 int16 (orden probable
+    pitch,roll,yaw, como el Push Position). flags = que ejes aplicar (bit0=angle1)."""
+    body = struct.pack("<hhh", int(pitch10), int(roll10), int(yaw10)) + bytes([flags & 0xff, field7 & 0xff])
+    return mb_frame(0x02, 0x04, dseq, 0x40, 0x04, 0x14, body)
+
+def gimbal_control_frame(dseq, v_pitch, v1=1024, v2=1024):
+    """0x04/0x01 Gimbal Control. 3 valores uint16 en 363..1685 (tipo stick; centro 1024 =
+    quieto, <1024 y >1024 = velocidad en cada sentido)."""
+    body = struct.pack("<HHH", v_pitch & 0xffff, v1 & 0xffff, v2 & 0xffff)
+    return mb_frame(0x02, 0x04, dseq, 0x40, 0x04, 0x01, body)
+
+def gimbal_move_frame(dseq, pitch_step, roll_step=0, yaw_step=0):
+    """0x04/0x15 Gimbal Movement. primeros 3 int8 = paso/velocidad, resto reservado
+    (20 bytes total)."""
+    body = struct.pack("<bbb", pitch_step, roll_step, yaw_step) + b"\x00" * 17
+    return mb_frame(0x02, 0x04, dseq, 0x40, 0x04, 0x15, body)
 
 
 def parse_header(p):

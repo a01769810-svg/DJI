@@ -17,7 +17,11 @@ $homeSsid = "depaez_5G"
 # 1er argumento puede ser un script .py; si no, se usa flight.py
 $rest = @($args)
 $script = "flight.py"
-if ($rest.Count -gt 0 -and $rest[0] -like "*.py") { $script = $rest[0]; $rest = $rest[1..($rest.Count-1)] }
+if ($rest.Count -gt 0 -and $rest[0] -like "*.py") {
+    $script = $rest[0]
+    # OJO: $rest[1..($n-1)] con n=1 da el rango DESCENDENTE 1..0 y reinyecta $rest[0].
+    if ($rest.Count -gt 1) { $rest = $rest[1..($rest.Count - 1)] } else { $rest = @() }
+}
 $scriptPath = Join-Path $PSScriptRoot $script
 
 function Get-NeoIP {
