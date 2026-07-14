@@ -322,3 +322,29 @@ Luego 41 bytes de DUML `0x01/0x0a` (header 11B con seq_num en frame[6:8], canale
 - **La transicion autoridad 02→03** ocurre a ~t+4 s en las 4 capturas (cuando la app ya tiene una posicion de referencia). Variante 02 = A=B=0 (autoridad sin referencia); variante 03 = A/B con la coordenada. La transicion NO depende de ningun valor del downlink previo (el token no aparece en DN en ningun endianness).
 - **Conclusion / correccion de #12/EXP-019:** el armado del Neo **NO exhibe canal firmado/cifrado** en las capturas. Los dos sospechosos (envoltorio 0x51/0x01, "handshake" 0x03/0xf8) y el "token" quedan explicados sin secretos. Por que fallaba `flight.py`: mandaba autoridad **solo variante-02** (coordenada en ceros), y omitia el heartbeat `0x03/0xd7`, el lote de parametros y la rafaga de init del despegue — todo reproducible.
 - **NO se necesita el APK para esta via.** Siguiente (cuando el usuario lo decida, gated y supervisado): construir en `flight.py` (a) autoridad variante-03 con coordenada (leida de telemetria o plausible), (b) heartbeat `0x03/0xd7` continuo, (c) la rafaga de init del despegue observada, y probar el armado en vuelo. Riesgo fisico real => solo con las precauciones de seguridad ya acordadas.
+
+
+### EXP-021 — SECUENCIA DE ARMADO COMPLETA, REPRODUCIDA Y VALIDADA BYTE A BYTE (sin hardware aun) (2026-07-13)
+- Estado: [OBSERVED] — todos los builders del armado reconstruyen el trafico real de la app; falta la prueba en dron.
+- Objetivo (fijado por el usuario): reproducir fielmente `HELLO -> reliable-UDP -> init -> 0x03/0xf8 -> 0x03/0x20 var-03 -> 0x03/0xd7 -> modo Manual -> 0x03/0xda -> sticks neutros -> aterrizaje`, validando byte a byte contra Quinta y Octava antes de tocar hardware.
+- **Dos correcciones de EXP-019/020 (via `analysis/unwrap.py`, censo interno des-envuelto):**
+  1. **`0x03/0xd7` es BIDIRECCIONAL.** El dron lo manda en DOWNLINK (3042×, telemetria de actitud) y la app en UPLINK (620×) como heartbeat de control — pero el uplink **arranca en t+9.65, DESPUES del despegue (t+9.05)**, no antes. No es precondicion del armado; es el latido de control ya en vuelo. (EXP-019/020 lo listaban como pieza previa; era mala atribucion — mi primer escaneo plano no lo veia porque va envuelto en 0x51/0x01.)
+  2. **El "contador" de la autoridad `0x03/0x20` es un timestamp Unix en segundos.** Quinta `0x6a543b60`, Octava `0x6a55629e` decodifican a fechas de 2026 (difieren ~21 h); +1 por envio a 1 Hz. => al forjar se usa la hora real (`int(time.time())`), no un valor viejo hardcodeado.
+- **Estructura decodificada de cada pieza (todas validadas):**
+  - Autoridad `0x03/0x20`: `<var:1> <lat:int32 LE> <lon:int32 LE> <ts:uint32 LE>`. var-02 => lat/lon=0; var-03 => coordenada en grados×1e6. rcv=0x03, attr=0x40.
+  - Heartbeat `0x03/0xd7`: 1er frame `01010000`; resto `01040000`+`uint32 LE` contador incremental. attr=0x80.
+  - Lote `0x03/0xf8`: 1er batch constante `0b163bde 0b163bdf 0b163be0` (IDs de parametro). rcv=0x03.
+  - Rafaga de armado (junto al `0x03/0xda`): `0x03/0x34` (vacio), `0x03/0x3c` (vacio), `0x0d/0x03` (`00000000`, rcv=0x0b).
+  - Despegue `0x03/0xda`: `05 ffffffff`. Va **crudo** en Quinta y envuelto en Octava (el envoltorio NO es candado). Nuestro emisor lo manda crudo (como Quinta, vuelo confirmado).
+- **VALIDACION (nuevo `analysis/validate_arm.py`, adversarial contra 2 sesiones):**
+  - Reconstruccion generica MB (CRC-8 cabecera + CRC-16): **Quinta 7108/7108** y **Octava 3197/3197** frames UP identicos byte a byte.
+  - Builders semanticos: **11/11 OK en Quinta Y en Octava** (modo, autoridad var-02 y var-03, heartbeat init y con contador, lote 0x03/0xf8, despegue, rafaga 0x34/0x3c/0d03).
+  - Privacidad: el validador extrae lat/lon del frame real solo para alimentar el builder y comparar; **nunca los imprime**.
+- **Cambios de codigo:**
+  - `neo_udp.py`: builders nuevos `authority_frame` (var-02/03 con ts-unix), `d7_frame`, `f8_frame`, `arm34/arm3c/arm0d03_frame`, `takeoff_frame`. Todos bare (snd=0x02), con rcv/attr correctos.
+  - `flight.py` reescrito: secuencia completa. **DRY (por defecto) ejecuta TODO menos el despegue** (init + autoridad + 0x03/0xf8 + rafaga + modo + heartbeat + neutro) => prueba segura de que el dron ACEPTA cada frame (ventana RX avanza) sin armar. `--fly --armed-ok` añade el despegue. Coordenada var-03 por CLI `--lat/--lon` (NO hardcodeada; sin ellas => var-02 con aviso).
+  - Autotest offline: los 7 tipos de frame + la rafaga construyen con CRC valido.
+- **Incognitas que solo resuelve el hardware (no mas analisis de escritorio):**
+  - Si el armado exige var-03 con coordenada REAL o acepta cualquiera/zeros (EXP-020 la describe como dato posicional, no firma => quiza no se valida).
+  - Si nuestra sesion recibe GPS en tierra para derivar la coordenada (EXP-013 sugiere que NO; la telemetria rica solo fluye volando) => de momento la coordenada se pasa por CLI.
+- **Siguiente (seguro, sin vuelo): correr `flight.py` en DRY contra el Neo** (PC en su WiFi, dron asegurado). Exito = la ventana RX type-5 avanza con la secuencia COMPLETA (incluidos 0x03/0xf8, autoridad var-03, rafaga y heartbeat), confirmando aceptacion a nivel transporte de todas las piezas nuevas. Solo despues, y con las precauciones ya acordadas (exterior, supervisado, failsafe=Aterrizar), se plantea `--fly`.

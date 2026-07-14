@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-flight.py — Vuelo del DJI Neo con el wrapper CORREGIDO (EXP-018).
+flight.py — Vuelo del DJI Neo reproduciendo FIELMENTE la secuencia de la app
+(EXP-021). Wrapper UDP fiable corregido (EXP-018) + armado completo.
 
-Reemplaza a vuelo.py (que usaba el wrapper roto). Construido sobre neo_udp.py.
-Todos los frames DUML (init, sticks, autoridad, takeoff) estan VALIDADOS byte a
-byte contra el vuelo real de la app (Quinta prueba.pcap).
+Secuencia objetivo (fiel a DJI Fly, validada byte a byte por
+analysis/validate_arm.py contra Quinta y Octava):
 
-Secuencia (fiel a lo que hace DJI Fly al despegar):
-  hello -> init (8 frames verbatim) -> settle (sticks NEUTRO + autoridad 0x03/0x20)
-  -> [SOLO con --fly --armed-ok] takeoff 0x03/0xda -> hover (neutro) -> land (throttle-min)
+  HELLO -> reliable-UDP (type-5) -> init (8 frames verbatim)
+        -> [settle] autoridad 0x03/0x20 var-02 + modo Manual 0x03/0xf9 + sticks NEUTRO
+        -> autoridad var-03 (coordenada GPS, grados*1e6 — pasada por CLI, NO hardcodeada)
+        -> lote de parametros 0x03/0xf8
+        -> [--fly] rafaga de armado (0x03/0x34, 0x03/0x3c, 0x0d/0x03) + despegue 0x03/0xda
+        -> heartbeat de vuelo 0x03/0xd7 (continuo) + sticks NEUTRO (hover)
+        -> aterrizaje: throttle-min sostenido
+
+Todos los frames DUML se construyen con builders VALIDADOS en neo_udp.py.
 
 MODOS:
-  (sin flags)         DRY RUN: abre sesion, init, y streamea NEUTRO + autoridad unos
-                      segundos. NO despega, NO arma (neutro no arma). Confirma que la
-                      ventana RX del dron avanza. SEGURO incluso en interior.
-  --fly --armed-ok    VUELO REAL. Despega, flota, aterriza. REQUIERE los DOS flags.
+  (sin flags)         DRY RUN: ejecuta TODA la secuencia MENOS el despegue 0x03/0xda.
+                      Manda init, autoridad (var-02/03), 0x03/0xf8, rafaga de armado,
+                      modo, heartbeat y sticks NEUTRO. Sirve para confirmar que el dron
+                      ACEPTA cada frame (su ventana RX type-5 avanza) SIN armar motores.
+                      SEGURO en interior.
+  --fly --armed-ok    VUELO REAL: incluye el despegue. REQUIERE los DOS flags.
+
+Coordenada de autoridad var-03 (privacidad):
+  --lat / --lon en grados decimales. Se pasan en tiempo de ejecucion, NO se guardan
+  en el repo. Sin ellas, la autoridad se queda en var-02 (coord en cero) y se avisa.
 
 SEGURIDAD (obligatoria para --fly):
-  - EXTERIOR abierto, con GPS. Persona supervisando presente.
+  - EXTERIOR abierto con GPS. Persona supervisando. Espacio despejado.
   - DJI Fly con failsafe = ATERRIZAR configurado de antemano.
-  - Hélices puestas y firmes. Espacio despejado (nadie cerca).
-  - CORTE DE EMERGENCIA REAL = boton de apagado del dron. Ctrl+C manda aterrizar,
-    pero si el script muere, el failsafe del dron debe bajarlo.
-  - NO hay comando de aterrizaje dedicado: se aterriza con throttle-min sostenido.
+  - Helices firmes. Corte de emergencia real = BOTON del dron (Ctrl+C manda aterrizar).
+  - No hay comando de aterrizaje dedicado fiable: se baja con throttle-min sostenido.
 
 USO:
-  python flight.py                       # DRY RUN seguro
-  python flight.py --fly --armed-ok      # VUELO REAL (solo exterior/supervisado)
-  python flight.py --fly --armed-ok --hover 4 --land 12
+  python flight.py                                   # DRY RUN seguro (todo menos despegue)
+  python flight.py --lat 19.4326 --lon -99.1332      # DRY con autoridad var-03
+  python flight.py --fly --armed-ok --lat .. --lon .. # VUELO REAL (solo exterior/supervisado)
 """
 import argparse, sys, time
 import neo_udp as N
@@ -52,11 +62,20 @@ def _V(r, p, th, y):
 NEUTRAL = (1024, 1024, 1024, 1024)     # roll,pitch,thr,yaw centrados => hover, NO arma
 THR_MIN = 364
 
+def deg_to_e6(d):
+    """grados decimales -> int32 grados*1e6 (formato de la autoridad var-03)."""
+    return int(round(d * 1_000_000))
+
 class Flight:
-    def __init__(self, sess):
+    def __init__(self, sess, lat=None, lon=None):
         self.s = sess
-        self.dseq = 0xe600            # secuencia DUML para los streams
-        self.actr = 0x6a543b60        # contador de la autoridad 0x03/0x20
+        self.dseq = 0xe600
+        self.hb = 0                       # contador del heartbeat 0x03/0xd7
+        self.hb_started = False
+        # autoridad var-03 solo si hay coordenada; si no, var-02
+        self.auth_state = 0x03 if (lat is not None and lon is not None) else 0x02
+        self.lat_e6 = deg_to_e6(lat) if lat is not None else 0
+        self.lon_e6 = deg_to_e6(lon) if lon is not None else 0
 
     def _dseq(self):
         v = self.dseq; self.dseq = (self.dseq + 1) & 0xffff; return v
@@ -66,48 +85,75 @@ class Flight:
                         b"\x01\x0d\x00" + _V(r, p, th, y) + b"\x40\x00\x02\x00\x00\x06\x55\x01\x04")
         return self.s.send_command(mb)
 
-    def authority(self, state=0x02):
-        mb = N.mb_frame(0x02, 0x03, self._dseq(), 0x40, 0x03, 0x20,
-                        bytes([state]) + bytes(8) + self.actr.to_bytes(4, "little"))
-        self.actr = (self.actr + 1) & 0xffffffff
-        return self.s.send_command(mb)
-
-    def takeoff(self):
-        mb = N.mb_frame(0x02, 0x03, self._dseq(), 0x40, 0x03, 0xda, b"\x05\xff\xff\xff\xff")
-        return self.s.send_command(mb)
+    def authority(self):
+        # ts = timestamp Unix real (el contador de la autoridad es la hora en segundos)
+        ts = int(time.time())
+        return self.s.send_command(
+            N.authority_frame(self._dseq(), ts, self.auth_state, self.lat_e6, self.lon_e6))
 
     def set_mode(self, mode=N.MODE_MANUAL):
         return self.s.send_command(N.mode_frame(self._dseq(), mode))
 
-    def stream(self, secs, sticks=None, mode=False, takeoff_once=False,
+    def f8(self):
+        return self.s.send_command(N.f8_frame(self._dseq()))
+
+    def arm_burst(self):
+        """Rafaga que la app manda junto al despegue (no arma por si sola)."""
+        self.s.send_command(N.arm34_frame(self._dseq()))
+        self.s.send_command(N.arm3c_frame(self._dseq()))
+        self.s.send_command(N.arm0d03_frame(self._dseq()))
+
+    def takeoff(self):
+        return self.s.send_command(N.takeoff_frame(self._dseq()))
+
+    def heartbeat(self):
+        if not self.hb_started:
+            self.hb_started = True
+            return self.s.send_command(N.d7_frame(self._dseq(), 0, init=True))
+        r = self.s.send_command(N.d7_frame(self._dseq(), self.hb))
+        self.hb = (self.hb + 1) & 0xffffffff
+        return r
+
+    def stream(self, secs, sticks=None, mode=False, auth=True, hb=False,
                takeoff_hold=False, label=""):
-        """Streamea (opcional) sticks @20Hz + modo @10Hz + autoridad @1Hz durante 'secs'.
-        takeoff_once=True: dispara 0x03/0xda UNA vez al inicio.
-        takeoff_hold=True: REPITE 0x03/0xda ~15Hz durante toda la fase (imita el
-                           'mantener presionado' del boton de despegue de la app).
-        sticks=None => no envia sticks. Devuelve ult. ventana RX."""
+        """Streamea durante 'secs' varias 'pistas' a su frecuencia observada:
+             sticks 20Hz · modo 10Hz · heartbeat d7 10Hz · autoridad 1Hz · keepalive 2Hz.
+           takeoff_hold=True: repite 0x03/0xda ~15Hz (imita 'mantener' el boton).
+           Devuelve la ultima ventana RX type-5 del dron."""
         if label: print(label, flush=True)
         end = time.time() + secs
-        n_stick = n_auth = n_mode = n_ka = n_tk = 0.0
-        fired = not takeoff_once
+        nt = {"stick": 0.0, "mode": 0.0, "hb": 0.0, "auth": 0.0, "ka": 0.0, "tk": 0.0}
         last_win = None
         while time.time() < end:
             now = time.time()
-            if takeoff_once and not fired:
-                self.takeoff(); fired = True; print("   >>> TAKEOFF (0x03/0xda) enviado", flush=True)
-            if takeoff_hold and now >= n_tk:
-                self.takeoff(); n_tk = now + 0.07     # ~15 Hz = 'hold' del boton
-            if mode and now >= n_mode:
-                self.set_mode(); n_mode = now + 0.1
-            if sticks and now >= n_stick:
-                self.stick(*sticks); n_stick = now + 0.05
-            if now >= n_auth:
-                self.authority(0x02); n_auth = now + 1.0
-            if now >= n_ka:                # keepalive del hello ~cada 0.5s
-                self.s.keepalive(); n_ka = now + 0.5
+            if takeoff_hold and now >= nt["tk"]:
+                self.takeoff(); nt["tk"] = now + 0.07
+            if mode and now >= nt["mode"]:
+                self.set_mode(); nt["mode"] = now + 0.1
+            if hb and now >= nt["hb"]:
+                self.heartbeat(); nt["hb"] = now + 0.1
+            if sticks and now >= nt["stick"]:
+                self.stick(*sticks); nt["stick"] = now + 0.05
+            if auth and now >= nt["auth"]:
+                self.authority(); nt["auth"] = now + 1.0
+            if now >= nt["ka"]:
+                self.s.keepalive(); nt["ka"] = now + 0.5
             w = self.s.poll(0.01)
             if w: last_win = w
         return last_win
+
+
+def run_common(f, args):
+    """init + settle + autoridad(var-03) + 0x03/0xf8 + rafaga de armado.
+       Comun a DRY y a --fly. NO incluye el despegue 0x03/0xda."""
+    print("enviando init (%d frames)..." % len(INIT))
+    for fr in INIT:
+        f.s.send_command(fr); time.sleep(0.03)
+    f.stream(1.5, mode=True, auth=True, label="0) fijando MODO MANUAL + autoridad...")
+    f.stream(args.settle, NEUTRAL, mode=True,
+             label="1) settle: modo + NEUTRO + autoridad var-0%d" % f.auth_state)
+    print("2) lote de parametros 0x03/0xf8 + rafaga de armado (0x03/0x34,0x3c,0x0d/03)...", flush=True)
+    f.f8(); f.arm_burst()
 
 
 def main():
@@ -115,7 +161,9 @@ def main():
     ap.add_argument("--fly", action="store_true", help="ejecutar VUELO REAL (motores)")
     ap.add_argument("--armed-ok", dest="armed_ok", action="store_true",
                     help="2do candado: confirma exterior+supervisado+failsafe")
-    ap.add_argument("--settle", type=float, default=3.0)
+    ap.add_argument("--lat", type=float, default=None, help="latitud grados (autoridad var-03)")
+    ap.add_argument("--lon", type=float, default=None, help="longitud grados (autoridad var-03)")
+    ap.add_argument("--settle", type=float, default=4.0)
     ap.add_argument("--tkhold", type=float, default=3.0, help="segundos de 'hold' del despegue")
     ap.add_argument("--hover", type=float, default=3.0)
     ap.add_argument("--land", type=float, default=12.0)
@@ -127,10 +175,15 @@ def main():
         sys.exit(1)
 
     s = N.Type5Session()
-    print("=" * 62)
+    print("=" * 64)
     print("  flight.py  —  %s" % ("VUELO REAL (motores)" if real else "DRY RUN (sin despegue)"))
     print("  seed=0x%04x primer seq=0x%04x session=0x%04x" % (s.seed, s.seq, s.session))
-    print("=" * 62)
+    if args.lat is None or args.lon is None:
+        print("  !! sin --lat/--lon -> autoridad en VAR-02 (coord en cero).")
+        print("     EXP-020 sugiere que el armado usa VAR-03 con coordenada; pasa --lat/--lon.")
+    else:
+        print("  autoridad VAR-03 con coordenada provista (no se registra el valor).")
+    print("=" * 64)
     if not s.open():
         print("SIN ack -> revisa WiFi del Neo / DJI Fly cerrado."); sys.exit(1)
     print("hello -> ACK. Sesion abierta.")
@@ -141,43 +194,42 @@ def main():
         if w: base = w; break
     print("ventana RX type-5 baseline:", "0x%04x" % base[0] if base else "?")
 
-    f = Flight(s)
-    print("enviando init (%d frames)..." % len(INIT))
-    for fr in INIT:
-        f.s.send_command(fr); time.sleep(0.03)
+    f = Flight(s, args.lat, args.lon)
 
     if not real:
-        f.stream(1.5, mode=True, label="0) fijando MODO MANUAL (0x03/0xf9)...")
-        win = f.stream(args.settle + 2.0, NEUTRAL, mode=True, label="DRY RUN: modo+NEUTRO+autoridad (NO despega)...")
+        run_common(f, args)
+        win = f.stream(args.hover, NEUTRAL, mode=True, hb=True,
+                       label="3) DRY: heartbeat 0x03/0xd7 + NEUTRO (NO despega)...")
         print("ventana RX final:", "0x%04x" % win[0] if win else "?")
         if base and win:
-            print(">>> %s" % ("VENTANA AVANZO (0x%04x->0x%04x): secuencia de vuelo ACEPTADA. Listo para --fly EXTERIOR."
-                  % (base[0], win[0]) if win[0] > base[0] else "ventana NO avanzo: revisar."))
+            print(">>> %s" % ("VENTANA AVANZO (0x%04x->0x%04x): el dron ACEPTA la secuencia completa "
+                  "(salvo despegue). Listo para --fly EXTERIOR." % (base[0], win[0])
+                  if win[0] != base[0] else "ventana NO avanzo: revisar transporte."))
         s.sock.close(); return
 
     # ---- VUELO REAL ----
-    print("\n" + "!" * 62)
+    print("\n" + "!" * 64)
     print(" VUELO REAL. EXTERIOR + SUPERVISADO + failsafe=Aterrizar.")
     print(" Ctrl+C = ATERRIZAR. Corte real = BOTON del dron.")
-    print("!" * 62, flush=True)
+    print("!" * 64, flush=True)
     try:
-        f.stream(1.5, mode=True, label="0) fijando MODO MANUAL (0x03/0xf9)...")
-        f.stream(args.settle, NEUTRAL, mode=True, label="1) settle: modo + neutro + autoridad")
+        run_common(f, args)
         print(">>> DESPEGUE en 5 s (Ctrl+C aborta)...", flush=True)
         for i in range(5, 0, -1):
             print("   ", i, flush=True); time.sleep(1.0)
         f.stream(args.tkhold, NEUTRAL, mode=True, takeoff_hold=True,
-                 label="2) DESPEGUE: manteniendo 0x03/0xda ~%.0fs (como el boton)..." % args.tkhold)
-        wtk = f.stream(args.hover, NEUTRAL, mode=True, label="3) HOVER (neutro, modo Manual)")
+                 label="4) DESPEGUE: manteniendo 0x03/0xda ~%.0fs (como el boton)..." % args.tkhold)
+        wtk = f.stream(args.hover, NEUTRAL, mode=True, hb=True,
+                       label="5) HOVER: heartbeat 0x03/0xd7 + NEUTRO (modo Manual)")
         print("   ventana RX t5:", ("0x%04x" % wtk[0]) if wtk else "?",
               "(seq propio ~0x%04x)" % f.s.seq, flush=True)
         print(">>> ATERRIZANDO: throttle-min. Mira descender...", flush=True)
-        f.stream(args.land, (1024, 1024, THR_MIN, 1024), label="")
+        f.stream(args.land, (1024, 1024, THR_MIN, 1024), hb=True, label="")
         print(">>> Fin. Si sigue en el aire: BOTON del dron o failsafe.", flush=True)
     except KeyboardInterrupt:
         print("\n!! ABORTO -> aterrizando (throttle-min)", flush=True)
         try:
-            f.stream(args.land, (1024, 1024, THR_MIN, 1024))
+            f.stream(args.land, (1024, 1024, THR_MIN, 1024), hb=True)
         except KeyboardInterrupt:
             print("Saliendo. Failsafe=Aterrizar deberia bajarlo; si no, BOTON del dron.")
     finally:

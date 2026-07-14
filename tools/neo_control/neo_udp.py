@@ -126,6 +126,64 @@ def mode_frame(dseq, mode=MODE_MANUAL):
     return mb_frame(0x02, 0x17, dseq, 0x40, 0x03, 0xf9, mode_payload(mode))
 
 
+# ---------------------------------------------------------------------------
+# Builders del ARMADO/DESPEGUE (EXP-021). Todos VALIDADOS byte a byte contra
+# Quinta/Octava por analysis/validate_arm.py. Frames DUML "bare" (no envueltos):
+# EXP-019 probo que el envoltorio 0x51/0x01 NO es el candado (Quinta despega con
+# 0x03/0xda crudo). Todos sender=0x02 (app).
+# ---------------------------------------------------------------------------
+
+def authority_frame(dseq, ts, state=0x02, lat_e6=0, lon_e6=0):
+    """0x03/0x20 — 'autoridad de vuelo'.
+      payload = <state:1> <lat:int32 LE> <lon:int32 LE> <ts:uint32 LE>
+      state=0x02: lat/lon en CERO (autoridad sin referencia de posicion).
+      state=0x03: lat/lon = coordenada del dron en grados*1e6 (NO es firma; EXP-020).
+      ts = contador = timestamp Unix en segundos (Quinta/Octava decodifican a 2026;
+           +1 por envio a 1 Hz). Se usa la hora real al forjar.
+    PRIVACIDAD: lat_e6/lon_e6 nunca se hardcodean ni se registran; se pasan en
+    tiempo de ejecucion (CLI) o se derivan de la telemetria del propio dron."""
+    if state == 0x02:
+        lat_e6 = lon_e6 = 0
+    body = (bytes([state & 0xff]) + struct.pack("<ii", lat_e6, lon_e6)
+            + struct.pack("<I", ts & 0xffffffff))
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0x20, body)
+
+
+def d7_frame(dseq, counter, init=False):
+    """0x03/0xd7 — heartbeat de control DURANTE el vuelo (empieza tras armar).
+      init=True (1er frame): payload = 01 01 00 00
+      resto:                 payload = 01 04 00 00 + <counter:uint32 LE>
+    attr=0x80. La app lo manda de forma continua; nuestro emisor no lo hacia."""
+    body = b"\x01\x01\x00\x00" if init else b"\x01\x04\x00\x00" + struct.pack("<I", counter & 0xffffffff)
+    return mb_frame(0x02, 0x03, dseq, 0x80, 0x03, 0xd7, body)
+
+
+# 0x03/0xf8 — lote de parametros (GET/SUBSCRIBE), NO cripto (EXP-020). El primer
+# lote observado en Quinta/Octava es constante (3 IDs de 4B). rcv=0x03.
+F8_FIRST_BATCH = bytes.fromhex("0b163bde0b163bdf0b163be0")
+def f8_frame(dseq, batch=F8_FIRST_BATCH):
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xf8, batch)
+
+
+# Ráfaga de armado que acompaña al 0x03/0xda (observada en Quinta y Octava):
+def arm34_frame(dseq):
+    """0x03/0x34 — payload vacio, rcv=0x03."""
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0x34, b"")
+
+def arm3c_frame(dseq):
+    """0x03/0x3c — payload vacio, rcv=0x03."""
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0x3c, b"")
+
+def arm0d03_frame(dseq):
+    """0x0d/0x03 — payload 00000000, rcv=0x0b (otro modulo)."""
+    return mb_frame(0x02, 0x0b, dseq, 0x40, 0x0d, 0x03, b"\x00\x00\x00\x00")
+
+
+def takeoff_frame(dseq):
+    """0x03/0xda subtipo 0x05 = armar/despegar. payload 05 ffffffff. rcv=0x03."""
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda, b"\x05\xff\xff\xff\xff")
+
+
 def parse_header(p):
     if len(p) < 8: return None
     x = 0
