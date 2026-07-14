@@ -348,3 +348,35 @@ Luego 41 bytes de DUML `0x01/0x0a` (header 11B con seq_num en frame[6:8], canale
   - Si el armado exige var-03 con coordenada REAL o acepta cualquiera/zeros (EXP-020 la describe como dato posicional, no firma => quiza no se valida).
   - Si nuestra sesion recibe GPS en tierra para derivar la coordenada (EXP-013 sugiere que NO; la telemetria rica solo fluye volando) => de momento la coordenada se pasa por CLI.
 - **Siguiente (seguro, sin vuelo): correr `flight.py` en DRY contra el Neo** (PC en su WiFi, dron asegurado). Exito = la ventana RX type-5 avanza con la secuencia COMPLETA (incluidos 0x03/0xf8, autoridad var-03, rafaga y heartbeat), confirmando aceptacion a nivel transporte de todas las piezas nuevas. Solo despues, y con las precauciones ya acordadas (exterior, supervisado, failsafe=Aterrizar), se plantea `--fly`.
+
+
+### EXP-022 — LA CAUSA REAL DEL "NO ARMA": mandabamos solo el paso 1 de una maquina de estados de despegue de 4 pasos (2026-07-13)
+- Estado: [OBSERVED, DECISIVO] — corrige EXP-020/021 y descarta la teoria del GPS/var-03 como bloqueo.
+- Contexto: en hardware, `flight.py --fly` (var-02) hizo que el **modo Manual SI se ejecutara en el flight controller** (primer comando confirmado a nivel FC, no solo transporte) pero **el despegue NO armo**. Se probo 2 veces, mismo resultado.
+- Refutacion de la teoria del GPS (correccion del asistente): el Neo **vuela en interior con vision system** (el usuario ha grabado su cuarto volando indoors) => el GPS NO es precondicion de armado. Pista falsa, descartada.
+- **Hallazgo real (de `unwrap.py` sobre Octava/Quinta):** el despegue de la app NO es "repetir 0x03/0xda:05". Es una **maquina de estados**:
+  1. `05 ffffffff` — INICIAR despegue (una vez).
+  2. `0a 01` — confirmar (~0.4 s despues).
+  3. `07 <fecha/hora> <len 0x13> <ID vuelo 19 dig>` — la **fecha/hora** es reproducible; el **ID de 19 digitos `2075123072524943360` es IDENTICO en Quinta y Octava** (2 sesiones/dias) => constante, hardcodeable.
+  4. `08` — COMMIT (aqui arma de verdad; a veces x2).
+  5. `0d <ts u32> <cola 12B>` — stream de control en vuelo continuo ~1 Hz que mantiene el vuelo.
+  - Nuestro `flight.py` repetia SOLO el paso 1 a 15 Hz y jamas mandaba 0a01/07/08 ni el stream 0d. Le deciamos "iniciar" 30 veces y nunca "confirmar/commit". Por eso el FC obedecia el modo pero rechazaba el despegue: **secuencia de armado incompleta.**
+- **Correccion de codigo (validada byte a byte):**
+  - `neo_udp.py`: builders `arm_confirm_frame` (0a01), `arm_datetime_frame` (07, fecha actual + ID constante), `arm_commit_frame` (08), `flyctrl_stream_frame` (0d). `validate_arm.py`: **15/15 OK en Quinta Y Octava** (incl. `id_const=True`).
+  - `flight.py`: el despegue ahora ejecuta `arm_sequence()` = 05 -> 0a01 -> 07 -> 08, y luego streamea el control 0x0d (1 Hz) + heartbeat 0x03/0xd7 + neutro en hover/aterrizaje. Se elimino el "hold" a 15 Hz del 05.
+  - Freno de seguridad: como esta version SI puede armar, pide una **confirmacion tecleada ("VOLAR")** antes del commit; aborta si stdin no es interactivo.
+- **Incognita restante:** el stream `0d` se replica estructuralmente (ts incremental + cola copiada de un frame real); no se conoce la semantica de todos sus campos. El armado/commit podria depender solo de 05->0a01->07->08; el `0d` sostiene el vuelo. Se sabra en la prueba.
+- **Siguiente (EXTERIOR, area despejada, supervisado; lo teclea el usuario, no el asistente):** `flight.py --fly --armed-ok` -> confirmar "VOLAR" -> observar si arma/despega. var-02 primero; si no arma, añadir --lat/--lon (var-03). El asistente NO ejecuta el despegue real.
+
+
+### EXP-023 — EL COMMIT VA ENVUELTO EN 0x51/0x01: mandabamos crudos los comandos que arman (2026-07-13)
+- Estado: [OBSERVED, DECISIVO] — corrige EXP-019 ("el envoltorio no es candado") y completa EXP-022.
+- Pista de hardware: `flight.py --fly` (ya con la maquina de estados 05->0a01->07->08, EXP-022) en EXTERIOR: **el modo cambia pero NO arma**, y la **ventana RX type-5 del dron queda congelada en el seed 0x7268** mientras nuestro seq corre a ~0x7790. El dron no consume nuestros comandos de armado.
+- **Hallazgo (clasificacion BARE vs WRAP del uplink en Quinta y Octava):**
+  - **BARE (crudos):** SOLO `0x03/0x20` (autoridad, var-02 y var-03) y `0x03/0xda:05` (iniciar).
+  - **ENVUELTOS en `0x51/0x01`:** TODO lo que arma — `0x03/0xda` sub `0a`/`07`/`08`/`0d`, `0x03/0xf8` (params), `0x03/0xf9` (modo), `0x03/0x34`, `0x03/0x3c`, `0x0d/0x03`, `0x03/0xd7` (heartbeat).
+  - Nuestro `flight.py` mandaba TODO crudo. El FC ignora el commit crudo (llega por transporte pero no por el canal de "transmision transparente" que el FC atiende) => modo si, armado no. EXP-019 concluyo mal porque solo miro el `05` (que si va crudo); los pasos de commit van envueltos.
+- **Estructura del contenedor `0x51/0x01` (decodificada):** outer `snd=0x3b rcv=0xe9 attr=0x00 cmd 0x51/0x01`, dseq = contador del canal; `payload = <frame DUML interno completo> + cola(22B)`; `cola = 00 99d4ac02 <dseq:u32 LE> ffffffff 0182 00*7` (`99d4ac02` y `0182` fijos entre sesiones).
+- **VALIDACION:** nuevo builder `neo_udp.wrap_5101`. `validate_arm.py` reconstruye **Quinta 4772/4776** y **Octava 2152/2156** frames envueltos byte a byte (los ~4 fallos por captura son frames con `0x55` anidado en su payload, irrelevantes). Total: **16/16 comprobaciones OK en ambas**.
+- **Cambio de codigo:** `flight.py` ahora envuelve en `0x51/0x01` (con `_wrapped()` y contador `wdseq`) el modo, `0x03/0xf8`, la rafaga, la confirmacion/07/commit, el stream `0d` y el heartbeat `0x03/0xd7`; deja bare la autoridad y el `05`. Test offline: CRCs OK, envoltura correcta por comando.
+- **Siguiente (EXTERIOR, supervisado; lo teclea el usuario):** reintentar `flight.py --fly --armed-ok`. Si ahora la ventana RX **avanza** durante el armado y el dron arma/despega => el envoltorio era la pieza que faltaba. Si sigue sin armar pese a avanzar la ventana, el sospechoso pasa a los lotes `0x03/0xf8` completos a rcv=0x17 y/o el stream `0x51/0x13`.

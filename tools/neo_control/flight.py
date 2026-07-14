@@ -41,6 +41,7 @@ USO:
   python flight.py --fly --armed-ok --lat .. --lon .. # VUELO REAL (solo exterior/supervisado)
 """
 import argparse, sys, time
+from datetime import datetime
 import neo_udp as N
 
 # --- Init verbatim capturado del vuelo real (Quinta), enviado como type-5 ---
@@ -72,6 +73,9 @@ class Flight:
         self.dseq = 0xe600
         self.hb = 0                       # contador del heartbeat 0x03/0xd7
         self.hb_started = False
+        self.fly_ts = int(time.time() * 1000) & 0xffffffff   # ts del stream de control 0x0d
+        self.armed = False
+        self.wdseq = 1                    # contador del canal 0x51/0x01 (transmision transparente)
         # autoridad var-03 solo si hay coordenada; si no, var-02
         self.auth_state = 0x03 if (lat is not None and lon is not None) else 0x02
         self.lat_e6 = deg_to_e6(lat) if lat is not None else 0
@@ -80,6 +84,13 @@ class Flight:
     def _dseq(self):
         v = self.dseq; self.dseq = (self.dseq + 1) & 0xffff; return v
 
+    def _wrapped(self, inner):
+        """Envia un frame DUML por el canal 0x51/0x01 (armado/commit/params van asi)."""
+        r = self.s.send_command(N.wrap_5101(self.wdseq, inner))
+        self.wdseq = (self.wdseq + 1) & 0xffffffff
+        return r
+
+    # -- BARE (crudos, como la app): sticks, autoridad, iniciar-despegue 05 --
     def stick(self, r, p, th, y):
         mb = N.mb_frame(0x02, 0xa9, self._dseq(), 0x00, 0x01, 0x0a,
                         b"\x01\x0d\x00" + _V(r, p, th, y) + b"\x40\x00\x02\x00\x00\x06\x55\x01\x04")
@@ -91,43 +102,66 @@ class Flight:
         return self.s.send_command(
             N.authority_frame(self._dseq(), ts, self.auth_state, self.lat_e6, self.lon_e6))
 
+    def takeoff(self):
+        return self.s.send_command(N.takeoff_frame(self._dseq()))
+
+    # -- ENVUELTOS en 0x51/0x01 (como la app): modo, params, rafaga, commit, control --
     def set_mode(self, mode=N.MODE_MANUAL):
-        return self.s.send_command(N.mode_frame(self._dseq(), mode))
+        return self._wrapped(N.mode_frame(self._dseq(), mode))
 
     def f8(self):
-        return self.s.send_command(N.f8_frame(self._dseq()))
+        return self._wrapped(N.f8_frame(self._dseq()))
 
     def arm_burst(self):
         """Rafaga que la app manda junto al despegue (no arma por si sola)."""
-        self.s.send_command(N.arm34_frame(self._dseq()))
-        self.s.send_command(N.arm3c_frame(self._dseq()))
-        self.s.send_command(N.arm0d03_frame(self._dseq()))
+        self._wrapped(N.arm34_frame(self._dseq()))
+        self._wrapped(N.arm3c_frame(self._dseq()))
+        self._wrapped(N.arm0d03_frame(self._dseq()))
 
-    def takeoff(self):
-        return self.s.send_command(N.takeoff_frame(self._dseq()))
+    def arm_sequence(self):
+        """Maquina de estados REAL del despegue (EXP-022): 05 -> 0a01 -> 07<fecha+id>
+        -> 08 commit. Cada paso con las pistas de soporte (modo/autoridad/keepalive)
+        entre medias. Al terminar, self.armed=True (empieza el stream de control 0x0d)."""
+        print("   4a) 05 iniciar despegue", flush=True)
+        self.takeoff()
+        self.stream(0.4, NEUTRAL, mode=True)
+        print("   4b) 0a01 confirmar + 07 fecha/ID (envueltos)", flush=True)
+        self._wrapped(N.arm_confirm_frame(self._dseq()))
+        n = datetime.now()
+        self._wrapped(N.arm_datetime_frame(self._dseq(), n.year, n.month, n.day,
+                                           n.hour, n.minute, n.second))
+        self.stream(0.6, NEUTRAL, mode=True)
+        print("   4c) 08 COMMIT (envuelto; aqui arma)", flush=True)
+        self._wrapped(N.arm_commit_frame(self._dseq()))
+        self.armed = True
+
+    def flyctrl(self):
+        """Latido de control en vuelo 0x03/0xda subtipo 0x0d (~1Hz), envuelto."""
+        self.fly_ts = (self.fly_ts + 1000) & 0xffffffff
+        return self._wrapped(N.flyctrl_stream_frame(self._dseq(), self.fly_ts))
 
     def heartbeat(self):
         if not self.hb_started:
             self.hb_started = True
-            return self.s.send_command(N.d7_frame(self._dseq(), 0, init=True))
-        r = self.s.send_command(N.d7_frame(self._dseq(), self.hb))
+            return self._wrapped(N.d7_frame(self._dseq(), 0, init=True))
+        r = self._wrapped(N.d7_frame(self._dseq(), self.hb))
         self.hb = (self.hb + 1) & 0xffffffff
         return r
 
     def stream(self, secs, sticks=None, mode=False, auth=True, hb=False,
-               takeoff_hold=False, label=""):
+               fly=False, label=""):
         """Streamea durante 'secs' varias 'pistas' a su frecuencia observada:
-             sticks 20Hz · modo 10Hz · heartbeat d7 10Hz · autoridad 1Hz · keepalive 2Hz.
-           takeoff_hold=True: repite 0x03/0xda ~15Hz (imita 'mantener' el boton).
+             sticks 20Hz · modo 10Hz · heartbeat d7 10Hz · control 0x0d 1Hz · autoridad 1Hz.
+           fly=True: manda el latido de control en vuelo 0x03/0xda:0x0d (~1Hz).
            Devuelve la ultima ventana RX type-5 del dron."""
         if label: print(label, flush=True)
         end = time.time() + secs
-        nt = {"stick": 0.0, "mode": 0.0, "hb": 0.0, "auth": 0.0, "ka": 0.0, "tk": 0.0}
+        nt = {"stick": 0.0, "mode": 0.0, "hb": 0.0, "fly": 0.0, "auth": 0.0, "ka": 0.0}
         last_win = None
         while time.time() < end:
             now = time.time()
-            if takeoff_hold and now >= nt["tk"]:
-                self.takeoff(); nt["tk"] = now + 0.07
+            if fly and now >= nt["fly"]:
+                self.flyctrl(); nt["fly"] = now + 1.0
             if mode and now >= nt["mode"]:
                 self.set_mode(); nt["mode"] = now + 0.1
             if hb and now >= nt["hb"]:
@@ -214,22 +248,30 @@ def main():
     print("!" * 64, flush=True)
     try:
         run_common(f, args)
+        # Confirmacion tecleada: esta version SI arma. Freno anti-despegue-en-interior.
+        print("\n  Esta version ejecuta la maquina de estados REAL: PUEDE despegar.")
+        print("  Confirma que estas en EXTERIOR, area despejada, GPS fijo, nadie cerca.")
+        try:
+            if input("  Escribe VOLAR y Enter para armar (cualquier otra cosa aborta): ").strip() != "VOLAR":
+                print(">>> No confirmado. Abortado sin armar."); s.sock.close(); return
+        except EOFError:
+            print(">>> Sin confirmacion (stdin no interactivo). Abortado sin armar."); s.sock.close(); return
         print(">>> DESPEGUE en 5 s (Ctrl+C aborta)...", flush=True)
         for i in range(5, 0, -1):
             print("   ", i, flush=True); time.sleep(1.0)
-        f.stream(args.tkhold, NEUTRAL, mode=True, takeoff_hold=True,
-                 label="4) DESPEGUE: manteniendo 0x03/0xda ~%.0fs (como el boton)..." % args.tkhold)
-        wtk = f.stream(args.hover, NEUTRAL, mode=True, hb=True,
-                       label="5) HOVER: heartbeat 0x03/0xd7 + NEUTRO (modo Manual)")
+        print("4) DESPEGUE: maquina de estados 05->0a01->07->08...", flush=True)
+        f.arm_sequence()
+        wtk = f.stream(args.hover, NEUTRAL, mode=True, hb=True, fly=True,
+                       label="5) HOVER: control 0x0d + heartbeat 0x03/0xd7 + NEUTRO")
         print("   ventana RX t5:", ("0x%04x" % wtk[0]) if wtk else "?",
               "(seq propio ~0x%04x)" % f.s.seq, flush=True)
         print(">>> ATERRIZANDO: throttle-min. Mira descender...", flush=True)
-        f.stream(args.land, (1024, 1024, THR_MIN, 1024), hb=True, label="")
+        f.stream(args.land, (1024, 1024, THR_MIN, 1024), hb=True, fly=True, label="")
         print(">>> Fin. Si sigue en el aire: BOTON del dron o failsafe.", flush=True)
     except KeyboardInterrupt:
         print("\n!! ABORTO -> aterrizando (throttle-min)", flush=True)
         try:
-            f.stream(args.land, (1024, 1024, THR_MIN, 1024), hb=True)
+            f.stream(args.land, (1024, 1024, THR_MIN, 1024), hb=True, fly=True)
         except KeyboardInterrupt:
             print("Saliendo. Failsafe=Aterrizar deberia bajarlo; si no, BOTON del dron.")
     finally:

@@ -101,10 +101,31 @@ def validate(path):
     if m:
         total += 1; ok += check("f8_frame(1er batch)", N.f8_frame(m["dseq"]), m["raw"])
 
-    # despegue 0x03/0xda 05ffffffff
+    # despegue 0x03/0xda: maquina de estados 05 -> 0a01 -> 07<fecha+id> -> 08
     m = first(0x03, 0xda, lambda m: m["payload"]==bytes.fromhex("05ffffffff"))
     if m:
-        total += 1; ok += check("takeoff_frame", N.takeoff_frame(m["dseq"]), m["raw"])
+        total += 1; ok += check("takeoff_frame (05)", N.takeoff_frame(m["dseq"]), m["raw"])
+    m = first(0x03, 0xda, lambda m: m["payload"]==bytes.fromhex("0a01"))
+    if m:
+        total += 1; ok += check("arm_confirm_frame (0a01)", N.arm_confirm_frame(m["dseq"]), m["raw"])
+    m = first(0x03, 0xda, lambda m: m["payload"][:1]==b"\x07")
+    if m:
+        p = m["payload"]
+        yr = struct.unpack("<H", p[1:3])[0]; mo,da,ho,mi,se = p[3],p[4],p[5],p[6],p[7]
+        idlen = p[8]; fid = p[9:9+idlen]
+        # el ID debe coincidir con la constante hardcodeada
+        idok = (fid == N.ARM_FLIGHT_ID)
+        total += 1; ok += check(f"arm_datetime_frame (07, id_const={idok})",
+                                N.arm_datetime_frame(m["dseq"], yr, mo, da, ho, mi, se), m["raw"])
+    m = first(0x03, 0xda, lambda m: m["payload"]==b"\x08")
+    if m:
+        total += 1; ok += check("arm_commit_frame (08)", N.arm_commit_frame(m["dseq"]), m["raw"])
+    # stream de control en vuelo 0x0d: valida estructura (ts + cola) sobre un frame real
+    m = first(0x03, 0xda, lambda m: m["payload"][:1]==b"\x0d" and len(m["payload"])==17)
+    if m:
+        ts = struct.unpack("<I", m["payload"][1:5])[0]; tail = m["payload"][5:]
+        total += 1; ok += check("flyctrl_stream_frame (0d, cola real)",
+                                N.flyctrl_stream_frame(m["dseq"], ts, tail), m["raw"])
 
     # rafaga 0x03/0x34, 0x03/0x3c, 0x0d/0x03
     m = first(0x03, 0x34, lambda m: len(m["payload"])==0)
@@ -113,6 +134,28 @@ def validate(path):
     if m: total += 1; ok += check("arm3c_frame", N.arm3c_frame(m["dseq"]), m["raw"])
     m = first(0x0d, 0x03, lambda m: m["payload"]==bytes.fromhex("00000000"))
     if m: total += 1; ok += check("arm0d03_frame", N.arm0d03_frame(m["dseq"]), m["raw"])
+
+    # 3) contenedor 0x51/0x01: reconstruir los frames EXTERNOS envueltos del uplink
+    print("\n-- 3) contenedor 0x51/0x01 (transmision transparente) --")
+    wrap_ok = wrap_n = 0
+    for ts, d, seq, fr in walk_frames(path):
+        if d != "UP":
+            continue
+        o = parse_mb(fr)
+        if not (o and o["cset"] == 0x51 and o["cid"] == 0x01):
+            continue
+        pl = o["payload"]
+        if not pl or pl[0] != 0x55:
+            continue
+        il = pl[1] | ((pl[2] & 3) << 8)
+        inner = pl[:il]
+        if len(inner) < il:
+            continue
+        wrap_n += 1
+        if N.wrap_5101(o["dseq"], inner) == fr:
+            wrap_ok += 1
+    print(f"  {wrap_ok}/{wrap_n} wrappers reconstruidos identicos")
+    total += 1; ok += (wrap_n > 0 and wrap_ok >= wrap_n - 5)   # <=4 casos raros (0x55 anidado)
 
     print(f"\nRESULTADO {os.path.basename(path)}: {ok}/{total} comprobaciones OK")
     return ok == total

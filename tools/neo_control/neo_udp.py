@@ -180,8 +180,58 @@ def arm0d03_frame(dseq):
 
 
 def takeoff_frame(dseq):
-    """0x03/0xda subtipo 0x05 = armar/despegar. payload 05 ffffffff. rcv=0x03."""
+    """0x03/0xda subtipo 0x05 = INICIAR despegue. payload 05 ffffffff. rcv=0x03.
+    OJO: por si solo NO arma. Es el paso 1 de la maquina de estados de despegue."""
     return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda, b"\x05\xff\xff\xff\xff")
+
+
+# --- Maquina de estados REAL del despegue 0x03/0xda (EXP-022, de Quinta/Octava) ---
+# Secuencia observada: 05 (iniciar) -> 0a01 (confirmar) -> 07<fecha+id> -> 08 (commit)
+# -> stream 0d<...> continuo ~1Hz (control en vuelo). Antes solo repetiamos el 05.
+# ID de vuelo de 19 digitos: IDENTICO en Quinta y Octava (2 sesiones/dias) => constante.
+ARM_FLIGHT_ID = b"2075123072524943360"   # 19 bytes ASCII, fijo
+
+def arm_confirm_frame(dseq):
+    """0x03/0xda subtipo 0x0a = confirmar. payload 0a 01."""
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda, b"\x0a\x01")
+
+def arm_datetime_frame(dseq, year, month, day, hour, minute, second):
+    """0x03/0xda subtipo 0x07 = fecha/hora + ID de vuelo.
+    payload = 07 <year:u16 LE> <mo><day><hr><min><sec> <len=0x13> <ID 19B ASCII>."""
+    body = (b"\x07" + struct.pack("<H", year)
+            + bytes([month & 0xff, day & 0xff, hour & 0xff, minute & 0xff, second & 0xff])
+            + bytes([len(ARM_FLIGHT_ID)]) + ARM_FLIGHT_ID)
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda, body)
+
+def arm_commit_frame(dseq):
+    """0x03/0xda subtipo 0x08 = COMMIT del despegue (aqui es donde arma de verdad)."""
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda, b"\x08")
+
+# Plantilla de la cola del stream de control en vuelo 0x03/0xda subtipo 0x0d.
+# payload = 0d <ts:u32 LE incremental> <cola 12B copiada de un frame real>.
+# La cola lleva setpoints/estado; se replica estructuralmente (best-effort).
+FLYCTRL_0D_TAIL = bytes.fromhex("9f010000931d4400f111f5fe")
+def flyctrl_stream_frame(dseq, ts32, tail=FLYCTRL_0D_TAIL):
+    """0x03/0xda subtipo 0x0d = latido de control en vuelo (mantiene el vuelo)."""
+    return mb_frame(0x02, 0x03, dseq, 0x40, 0x03, 0xda,
+                    b"\x0d" + struct.pack("<I", ts32 & 0xffffffff) + tail)
+
+
+# ---------------------------------------------------------------------------
+# CONTENEDOR 0x51/0x01 "transmision transparente" (EXP-023). CORRIGE EXP-019/022:
+# los comandos de armado/commit (0x03/0xda 0a/07/08/0d, 0x03/0xf8, 0x03/0xf9,
+# 0x03/0x34, 0x03/0x3c, 0x0d/0x03, 0x03/0xd7) la app los manda ENVUELTOS aqui, no
+# crudos. Solo la autoridad 0x03/0x20 y el 0x03/0xda:05 van bare. Enviar el commit
+# crudo => el FC lo ignora (cambia modo pero no arma).
+# Validado: reconstruye 4772/4776 (Quinta) y 2152/2156 (Octava) frames envueltos.
+#   outer: snd=0x3b rcv=0xe9 attr=0x00 cmd 0x51/0x01, dseq = contador del canal.
+#   payload = <frame DUML interno completo> + cola(22B).
+#   cola = 00 99d4ac02 <dseq:u32 LE> ffffffff 0182 00*7
+# ---------------------------------------------------------------------------
+def wrap_5101(outer_dseq, inner_frame):
+    tail = (b"\x00" + bytes.fromhex("99d4ac02") + struct.pack("<I", outer_dseq & 0xffffffff)
+            + b"\xff\xff\xff\xff" + b"\x01\x82" + b"\x00" * 7)
+    return mb_frame(0x3b, 0xe9, outer_dseq & 0xffff, 0x00, 0x51, 0x01, inner_frame + tail)
 
 
 def parse_header(p):
