@@ -34,32 +34,36 @@ import video as V
 
 PCAP_DEFAULT = "C:\\Users\\santi\\Desktop\\DJI project\\Novena captura.pcap"
 
-# --- Patron de vuelo (suave, simetrico, da PARALAJE para SLAM). Deflexion BAJA (interior). ---
-DEF = 130
+# --- Patron de vuelo (suave, simetrico, da PARALAJE para SLAM). Deflexion via --defl. ---
+# 130 = casi no traslada (interior conservador); ~250 = traslacion visible; ~350 = amplio.
+# El paralaje para SLAM NECESITA traslacion real, asi que el default sube a 250. Tope 500.
 def _mv(dr=0, dp=0, dyaw=0):
     return (1024 + dr, 1024 + dp, 1024, 1024 + dyaw)
 NEUTRAL = F.NEUTRAL
-FWD, BACK  = _mv(dp=DEF),  _mv(dp=-DEF)
-LEFT, RIGHT = _mv(dr=-DEF), _mv(dr=DEF)
-YAWR, YAWL = _mv(dyaw=DEF), _mv(dyaw=-DEF)
 
-# secuencia (sticks, segundos). Simetrica: cada movimiento y su opuesto -> vuelve ~al inicio.
-PATTERN = [
-    (NEUTRAL, 5.0),                                   # estabilizar
-    (FWD, 2.0), (NEUTRAL, 1.5), (BACK, 2.0), (NEUTRAL, 1.5),
-    (LEFT, 2.0), (NEUTRAL, 1.5), (RIGHT, 2.0), (NEUTRAL, 1.5),
-    (YAWR, 3.0), (NEUTRAL, 1.5), (YAWL, 3.0), (NEUTRAL, 1.5),
-]
+def build_pattern(defl):
+    """Secuencia (sticks, segundos) para deflexion 'defl'. Simetrica: cada movimiento y su
+    opuesto -> el dron vuelve ~al inicio (lazo abierto). defl mas alto = mas distancia."""
+    d = max(0, min(int(defl), 500))                   # tope de seguridad (rango stick +-660)
+    FWD, BACK   = _mv(dp=d),   _mv(dp=-d)
+    LEFT, RIGHT = _mv(dr=-d),  _mv(dr=d)
+    YAWR, YAWL  = _mv(dyaw=d), _mv(dyaw=-d)
+    return [
+        (NEUTRAL, 5.0),                               # estabilizar
+        (FWD, 2.0), (NEUTRAL, 1.5), (BACK, 2.0), (NEUTRAL, 1.5),
+        (LEFT, 2.0), (NEUTRAL, 1.5), (RIGHT, 2.0), (NEUTRAL, 1.5),
+        (YAWR, 3.0), (NEUTRAL, 1.5), (YAWL, 3.0), (NEUTRAL, 1.5),
+    ]
 
-def stick_at(t_air, cap):
-    """Devuelve los sticks para 't_air' segundos en el aire, recorriendo PATTERN en bucle
+def stick_at(t_air, cap, pattern):
+    """Devuelve los sticks para 't_air' segundos en el aire, recorriendo 'pattern' en bucle
     hasta 'cap'; al pasar cap, NEUTRO (el aterrizaje lo maneja el estado LAND)."""
     if t_air >= cap:
         return NEUTRAL
-    total = sum(d for _, d in PATTERN)
+    total = sum(d for _, d in pattern)
     tt = t_air % total
     acc = 0.0
-    for sticks, d in PATTERN:
+    for sticks, d in pattern:
         if tt < acc + d:
             return sticks
         acc += d
@@ -143,8 +147,9 @@ def _events_no_sticks(pcap, tmax):
 
 def run(args):
     real = args.fly and args.armed_ok
+    pattern = build_pattern(args.defl)                 # patron con la deflexion pedida
     print("=" * 64)
-    print("  mapflight.py  —  %s" % ("VUELO + GRABACION" if real else "DRY (graba en tierra, sin despegar)"))
+    print("  mapflight.py  —  %s  (defl=%d)" % ("VUELO + GRABACION" if real else "DRY (graba en tierra, sin despegar)", args.defl))
     print("=" * 64)
     if args.fly and not args.armed_ok:
         print("!! --fly requiere --armed-ok. Abortado."); return
@@ -240,7 +245,7 @@ def run(args):
                         if st["max_vid"] and (t - land_start) > 14.0:
                             break
                     else:
-                        sticks = stick_at(t_air, args.cap)
+                        sticks = stick_at(t_air, args.cap, pattern)
                 else:
                     sticks = NEUTRAL
             # 4) NUESTROS sticks (bare, 20Hz). Modo/autoridad/sub13 vienen del replay; en
@@ -262,8 +267,14 @@ def run(args):
             # 5) reporte
             if t - last_report >= 1.0:
                 phase = "DRY" if not real else ("LAND" if landing else ("AIR" if takeoff_sent else "GROUND"))
-                mot = st["osd"]["motor_on"] if st["osd"] else "?"
-                print("  t+%5.1f [%s] video=%d pkts, vseq=0x%04x, motores=%s" % (t, phase, len(st["vpkts"]), st["max_vid"], mot), flush=True)
+                o = st["osd"]
+                mot = o["motor_on"] if o else "?"
+                # altura + velocidad horizontal: para VER (no adivinar) cuan alto/rapido vuela.
+                # vgx/vgy en marco MUNDO (cuantizados 0.1 m/s); util para calibrar --defl.
+                alt = ("%.1fm" % o["height_m"]) if o else "?"
+                spd = ("%.1f" % (o["vgx"] ** 2 + o["vgy"] ** 2) ** 0.5) if o else "?"
+                print("  t+%5.1f [%s] video=%d pkts, motores=%s alt=%s velH=%sm/s"
+                      % (t, phase, len(st["vpkts"]), mot, alt, spd), flush=True)
                 last_report = t
     except KeyboardInterrupt:
         print("\n!! Ctrl+C -> ATERRIZANDO (throttle-min)", flush=True)
@@ -315,6 +326,10 @@ def main():
     ap.add_argument("--tmax", type=float, default=50.0, help="replay del init hasta t+N (mantiene keyframes)")
     ap.add_argument("--tvideo", type=float, default=18.0, help="segundos en tierra antes de despegar (replay ~12s + settle limpio ~6s)")
     ap.add_argument("--cap", type=float, default=30.0, help="segundos MAXIMOS en el aire antes de aterrizar")
+    ap.add_argument("--defl", type=float, default=250.0,
+                    help="deflexion del stick sobre el centro (1024) en el patron. 130=casi "
+                         "no traslada, 250=visible (default), 350=amplio. Tope 500. Subir para "
+                         "mas paralaje (necesita mas espacio); bajar si el cuarto es chico")
     ap.add_argument("--out", default="map_video.h265", help="archivo de video de salida")
     ap.add_argument("--decode", metavar="FILE", default=None, help="decodificar un .h265 (usa el .venv)")
     args = ap.parse_args()
