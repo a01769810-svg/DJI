@@ -88,6 +88,9 @@ def _receiver(s, st):
                 if w[0] > s.send_start:
                     s.send_start = w[0]
                 s.drone_next = w[1]
+        o = N.find_osd_general(d)                      # estado del FC (para saber si arma)
+        if o:
+            st["osd"] = o
 
 
 def raw_send(s, mb):
@@ -110,13 +113,22 @@ def _events_no_sticks(pcap, tmax):
 
 
 def run(args):
-    s = N.Type5Session()
     real = args.fly and args.armed_ok
     print("=" * 64)
     print("  mapflight.py  —  %s" % ("VUELO + GRABACION" if real else "DRY (graba en tierra, sin despegar)"))
     print("=" * 64)
     if args.fly and not args.armed_ok:
         print("!! --fly requiere --armed-ok. Abortado."); return
+
+    # Los flags --fly --armed-ok YA son la confirmacion (sin tecleo). Aviso y arranca:
+    # hay ~tvideo s en tierra antes del despegue y Ctrl+C aborta/aterriza en cualquier momento.
+    if real:
+        print("\n" + "!" * 64)
+        print(" VUELO REAL + GRABACION. Area despejada + supervisado.")
+        print(" Despega en ~%ds (tras estabilizar el video). Cap de vuelo: %ds. Ctrl+C = ATERRIZAR." % (args.tvideo, args.cap))
+        print("!" * 64, flush=True)
+
+    s = N.Type5Session()
     if not s.open():
         print("SIN ack -> revisa WiFi del Neo / DJI Fly cerrado."); return
     try:
@@ -124,21 +136,9 @@ def run(args):
     except Exception:
         pass
     events = _events_no_sticks(args.pcap, args.tmax)
-    print("hello -> ACK. comandos de arranque de video (sin sticks): %d" % len(events))
+    print("hello -> ACK. comandos de arranque de video (sin sticks): %d  -> arrancando ya" % len(events), flush=True)
 
-    if real:
-        print("\n" + "!" * 64)
-        print(" VUELO REAL + GRABACION. Area despejada + supervisado. Ctrl+C = ATERRIZAR.")
-        print(" Despega ~%ds tras arrancar (cuando el video este estable). Cap de vuelo: %ds." % (args.tvideo, args.cap))
-        print("!" * 64, flush=True)
-        try:
-            c = input("  Escribe VOLAR y Enter para autorizar (otra cosa = solo DRY): ").strip()
-        except EOFError:
-            c = ""
-        if c != "VOLAR":
-            print(">>> No confirmado -> corriendo en DRY (sin despegar)."); real = False
-
-    st = {"vpkts": [], "vwrap": 0, "vlast": None, "max_vid": 0, "max_tel": 0, "stop": False}
+    st = {"vpkts": [], "vwrap": 0, "vlast": None, "max_vid": 0, "max_tel": 0, "osd": None, "stop": False}
     rx = threading.Thread(target=_receiver, args=(s, st), daemon=True)
     rx.start()
 
@@ -155,15 +155,18 @@ def run(args):
     try:
         while True:
             t = time.time() - t0
-            # 1) replay del init de la app (arranca+mantiene video), respetando la ventana
-            while ei < len(events) and events[ei][0] <= t:
-                if ((s.seq - s.drone_next) & 0xffff) > s.WINDOW:
-                    break
-                try:
-                    raw_send(s, events[ei][1])
-                except Exception:
-                    pass
-                ei += 1
+            # 1) replay del init de la app (arranca el video), respetando la ventana. En VUELO
+            #    se DETIENE 1s antes del despegue: asi la ventana type-5 queda LIMPIA para que
+            #    el AUTO_FLY y los sticks pasen (el video ya se sostiene con el ACK type-0x04).
+            if (not real) or t < t_takeoff - 6.0:      # SETTLE limpio de 6s antes del despegue
+                while ei < len(events) and events[ei][0] <= t:
+                    if ((s.seq - s.drone_next) & 0xffff) > s.WINDOW:
+                        break
+                    try:
+                        raw_send(s, events[ei][1])
+                    except Exception:
+                        pass
+                    ei += 1
             # 2) ACK type-0x04 ~30Hz (sostiene el video)
             if t - last_ack >= 0.033:
                 try:
@@ -178,8 +181,16 @@ def run(args):
                     break
             else:
                 if not takeoff_sent and t >= t_takeoff:
+                    o = st["osd"]
+                    if o:
+                        why = N.START_FAIL_ENUM.get(o["start_fail_reason"], "0x%02x?" % o["start_fail_reason"])
+                        print(">>> OSD pre-despegue: estado=%s motores=%s en_tierra=%s | MOTIVO NO-ARRANQUE: %s"
+                              % (N.FLYC_STATE_ENUM.get(o["flyc_state"], "?"), o["motor_on"], o["on_ground"], why), flush=True)
+                    else:
+                        print(">>> OSD pre-despegue: NO recibido (FC no nos empuja OSD = no enganchado)", flush=True)
                     print(">>> AUTO_FLY (despegue) en t+%.1f" % t, flush=True)
-                    raw_send(s, N.wrap_5101(0xA000 + ei, N.funcctrl_frame(0xE000, N.AUTO_FLY)))
+                    raw_send(s, N.wrap_5101(wctr, N.funcctrl_frame(mdseq, N.AUTO_FLY)))
+                    wctr = (wctr + 1) & 0xffffffff; mdseq = (mdseq + 1) & 0xffff
                     takeoff_sent = True
                 if takeoff_sent:
                     t_air = t - t_takeoff
@@ -198,7 +209,8 @@ def run(args):
             #    vuelo real reforzamos modo (wrapped, 10Hz) + autoridad (bare, 1Hz) como flight.py.
             if t - last_stick >= 0.05:
                 _send_stick(s, sticks); last_stick = t
-            if real and takeoff_sent:
+            if real:                                   # modo+autoridad DESDE EL SUELO (settle
+                #                                        continuo; el FC lo necesita para armar)
                 if t - last_mode >= 0.1:
                     try:
                         raw_send(s, N.wrap_5101(wctr, N.mode_frame(mdseq)))
@@ -214,7 +226,8 @@ def run(args):
             # 5) reporte
             if t - last_report >= 1.0:
                 phase = "DRY" if not real else ("LAND" if landing else ("AIR" if takeoff_sent else "GROUND"))
-                print("  t+%5.1f [%s] video=%d pkts, vseq=0x%04x" % (t, phase, len(st["vpkts"]), st["max_vid"]), flush=True)
+                mot = st["osd"]["motor_on"] if st["osd"] else "?"
+                print("  t+%5.1f [%s] video=%d pkts, vseq=0x%04x, motores=%s" % (t, phase, len(st["vpkts"]), st["max_vid"], mot), flush=True)
                 last_report = t
     except KeyboardInterrupt:
         print("\n!! Ctrl+C -> ATERRIZANDO (throttle-min)", flush=True)
@@ -264,7 +277,7 @@ def main():
     ap.add_argument("--armed-ok", dest="armed_ok", action="store_true", help="2do candado de seguridad")
     ap.add_argument("--pcap", default=PCAP_DEFAULT, help="captura para el arranque de video")
     ap.add_argument("--tmax", type=float, default=50.0, help="replay del init hasta t+N (mantiene keyframes)")
-    ap.add_argument("--tvideo", type=float, default=14.0, help="segundos en tierra antes de despegar (video estable)")
+    ap.add_argument("--tvideo", type=float, default=18.0, help="segundos en tierra antes de despegar (replay ~12s + settle limpio ~6s)")
     ap.add_argument("--cap", type=float, default=30.0, help="segundos MAXIMOS en el aire antes de aterrizar")
     ap.add_argument("--out", default="map_video.h265", help="archivo de video de salida")
     ap.add_argument("--decode", metavar="FILE", default=None, help="decodificar un .h265 (usa el .venv)")
