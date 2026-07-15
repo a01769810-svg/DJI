@@ -6,8 +6,11 @@ mapflight.py — Vuela un patron SUAVE y GRABA video a la vez (para mapeo SLAM).
 Combina el arranque/sosten/captura de video (video.py) con el control de vuelo. Usa DOS
 HILOS: el RECEPTOR drena el socket continuamente (para no perder video, ni siquiera cuando
 el hilo de control esta ocupado); el hilo de CONTROL manda todo el uplink (replay del init
-de la app que arranca el video + AUTO_FLY + sticks + ACK type-0x04) por type-5 CRUDO
-respetando la ventana RX del dron (no usa send_command, cuyo _pump descarta video).
+de la app que arranca el video + AUTO_FLY + sticks + ACK type-0x04) por type-5 sin el
+_pump de send_command (que descarta video), pero FIABLE: gate a la ventana RX + cache +
+RETRANSMISION del seq atascado (raw_send/retransmit). Sin la retransmision, un solo
+paquete de uplink perdido atascaba el stream type-5 (ordenado) y el AUTO_FLY nunca armaba
+-> ese era el bug del despegue; flight.py no lo tenia porque send_command ya retransmite.
 
 MODOS:
   (sin flags)         DRY: arranca y GRABA video en TIERRA, sticks NEUTRO, SIN despegar.
@@ -94,11 +97,37 @@ def _receiver(s, st):
 
 
 def raw_send(s, mb):
-    """Envia un frame MB como type-5 CRUDO (sin el _pump que descarta video)."""
+    """Envia un frame MB como type-5 CRUDO (sin el _pump que descarta video) pero FIABLE:
+    respeta la ventana RX del dron y CACHEA el paquete para poder retransmitirlo.
+    Devuelve True si se envio, False si la ventana estaba llena (reintentar luego).
+
+    POR QUE (root cause de que mapflight no armara): el canal type-5 es un stream ORDENADO
+    y fiable. Si un solo paquete de uplink se pierde (UDP + el video inunda el socket), la
+    ventana del dron se ATASCA en ese seq y el FC NO procesa nada posterior -> el AUTO_FLY
+    nunca llega procesado. El OSD sigue llegando (downlink) dando falsa señal de 'listo'.
+    flight.py (send_command) sobrevive porque pacea a la ventana Y retransmite; el raw_send
+    viejo no hacia ninguna de las dos. Esto porta ambas, sin meter recv aqui (el hilo
+    receptor mantiene drone_next/send_start)."""
+    if ((s.seq - s.drone_next) & 0xffff) > s.WINDOW:   # no adelantarse a lo que el dron acepto
+        return False
     pkt = N.build_type5(s.session, s.seq, s.send_start, s.seq, s.ctr, mb)
+    s.sent[s.seq] = pkt                                 # cache para retransmision
     s.sock.sendto(pkt, N.DRONE)
     s.seq = (s.seq + 8) & 0xffff
     s.ctr = (s.ctr + 1) & 0xff
+    if len(s.sent) > 256:                              # poda: deja las ultimas ~256 tramas
+        for k in sorted(s.sent)[:len(s.sent) - 256]:
+            del s.sent[k]
+    return True
+
+
+def retransmit(s):
+    """Si el dron sigue esperando un seq que ya mandamos (stream atascado por un paquete
+    perdido), reenvialo. Es lo que DESATASCA el type-5 y permite que el AUTO_FLY pase.
+    Igual que el _pump de send_command, pero el recv lo hace el hilo receptor."""
+    gap = (s.seq - s.drone_next) & 0xffff
+    if 0 < gap <= 0x8000 and s.drone_next in s.sent:
+        s.sock.sendto(s.sent[s.drone_next], N.DRONE)
 
 
 def _events_no_sticks(pcap, tmax):
@@ -144,9 +173,11 @@ def run(args):
 
     t0 = time.time()
     ei = 0
-    last_ack = last_stick = last_report = last_mode = last_auth = -1.0
+    last_ack = last_stick = last_report = last_mode = last_auth = last_retx = -1.0
     wctr = 0xA000; mdseq = 0xd000; adseq = 0xc000
     takeoff_sent = False
+    pre_to_reported = False        # ¿ya imprimimos el OSD pre-despegue? (una vez)
+    auto_fly_mb = None             # frame AUTO_FLY pendiente (se reintenta hasta entrar en ventana)
     landing = False
     land_start = None
     t_takeoff = args.tvideo
@@ -155,17 +186,18 @@ def run(args):
     try:
         while True:
             t = time.time() - t0
+            # 0) retransmision: si el stream type-5 se atasco por un paquete perdido,
+            #    desatascarlo reenviando el seq que el dron aun espera. SIN esto un solo
+            #    drop mata el control y el AUTO_FLY nunca arma (era el bug del despegue).
+            if t - last_retx >= 0.02:
+                retransmit(s); last_retx = t
             # 1) replay del init de la app (arranca el video), respetando la ventana. En VUELO
             #    se DETIENE 1s antes del despegue: asi la ventana type-5 queda LIMPIA para que
             #    el AUTO_FLY y los sticks pasen (el video ya se sostiene con el ACK type-0x04).
             if (not real) or t < t_takeoff - 6.0:      # SETTLE limpio de 6s antes del despegue
                 while ei < len(events) and events[ei][0] <= t:
-                    if ((s.seq - s.drone_next) & 0xffff) > s.WINDOW:
-                        break
-                    try:
-                        raw_send(s, events[ei][1])
-                    except Exception:
-                        pass
+                    if not raw_send(s, events[ei][1]):     # ventana llena: reintentar este
+                        break                               # evento luego (mantiene el ORDEN)
                     ei += 1
             # 2) ACK type-0x04 ~30Hz (sostiene el video)
             if t - last_ack >= 0.033:
@@ -181,17 +213,23 @@ def run(args):
                     break
             else:
                 if not takeoff_sent and t >= t_takeoff:
-                    o = st["osd"]
-                    if o:
-                        why = N.START_FAIL_ENUM.get(o["start_fail_reason"], "0x%02x?" % o["start_fail_reason"])
-                        print(">>> OSD pre-despegue: estado=%s motores=%s en_tierra=%s | MOTIVO NO-ARRANQUE: %s"
-                              % (N.FLYC_STATE_ENUM.get(o["flyc_state"], "?"), o["motor_on"], o["on_ground"], why), flush=True)
-                    else:
-                        print(">>> OSD pre-despegue: NO recibido (FC no nos empuja OSD = no enganchado)", flush=True)
-                    print(">>> AUTO_FLY (despegue) en t+%.1f" % t, flush=True)
-                    raw_send(s, N.wrap_5101(wctr, N.funcctrl_frame(mdseq, N.AUTO_FLY)))
-                    wctr = (wctr + 1) & 0xffffffff; mdseq = (mdseq + 1) & 0xffff
-                    takeoff_sent = True
+                    if not pre_to_reported:
+                        o = st["osd"]
+                        if o:
+                            why = N.START_FAIL_ENUM.get(o["start_fail_reason"], "0x%02x?" % o["start_fail_reason"])
+                            print(">>> OSD pre-despegue: estado=%s motores=%s en_tierra=%s | MOTIVO NO-ARRANQUE: %s"
+                                  % (N.FLYC_STATE_ENUM.get(o["flyc_state"], "?"), o["motor_on"], o["on_ground"], why), flush=True)
+                        else:
+                            print(">>> OSD pre-despegue: NO recibido (FC no nos empuja OSD = no enganchado)", flush=True)
+                        pre_to_reported = True
+                    # el AUTO_FLY DEBE entrar EN la ventana. Se construye una vez (contadores
+                    # estables) y se REINTENTA cada vuelta; el retransmit desatasca si hace falta.
+                    if auto_fly_mb is None:
+                        auto_fly_mb = N.wrap_5101(wctr, N.funcctrl_frame(mdseq, N.AUTO_FLY))
+                        wctr = (wctr + 1) & 0xffffffff; mdseq = (mdseq + 1) & 0xffff
+                    if raw_send(s, auto_fly_mb):
+                        print(">>> AUTO_FLY (despegue) ENVIADO en ventana en t+%.1f" % t, flush=True)
+                        takeoff_sent = True
                 if takeoff_sent:
                     t_air = t - t_takeoff
                     if not landing and (t_air >= args.cap):
@@ -212,17 +250,15 @@ def run(args):
             if real:                                   # modo+autoridad DESDE EL SUELO (settle
                 #                                        continuo; el FC lo necesita para armar)
                 if t - last_mode >= 0.1:
-                    try:
-                        raw_send(s, N.wrap_5101(wctr, N.mode_frame(mdseq)))
-                    except Exception:
-                        pass
-                    wctr = (wctr + 1) & 0xffffffff; mdseq = (mdseq + 1) & 0xffff; last_mode = t
+                    # avanza los contadores SOLO si el frame entro en ventana (si no, se
+                    # reintenta con el mismo contador -> canal 0x51/01 sin huecos)
+                    if raw_send(s, N.wrap_5101(wctr, N.mode_frame(mdseq))):
+                        wctr = (wctr + 1) & 0xffffffff; mdseq = (mdseq + 1) & 0xffff
+                    last_mode = t
                 if t - last_auth >= 1.0:
-                    try:
-                        raw_send(s, N.authority_frame(adseq, int(time.time()), 0x02))
-                    except Exception:
-                        pass
-                    adseq = (adseq + 1) & 0xffff; last_auth = t
+                    if raw_send(s, N.authority_frame(adseq, int(time.time()), 0x02)):
+                        adseq = (adseq + 1) & 0xffff
+                    last_auth = t
             # 5) reporte
             if t - last_report >= 1.0:
                 phase = "DRY" if not real else ("LAND" if landing else ("AIR" if takeoff_sent else "GROUND"))
