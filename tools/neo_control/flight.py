@@ -235,8 +235,24 @@ class Flight:
         'defl' = magnitud del stick sobre 1024 (None => default por eje). Subirla para
         vencer el hold de posicion por vision del Neo (pitch/roll pequenos no trasladan).
         El signo real de cada eje se lee en la telemetria (yaw / pitch+vgx / roll+vgy)."""
-        d = defl if defl is not None else {"yaw": D_YAW, "forward": D_PITCH, "roll": D_ROLL}[name]
+        d = defl if defl is not None else {"yaw": D_YAW, "forward": D_PITCH,
+                                           "roll": D_ROLL, "demo": 250}[name]
         d = max(0, min(int(d), 500))              # tope de seguridad (rango stick +-660)
+        if name == "demo":
+            # secuencia completa: izquierda, derecha, frente, atras, giro der, giro izq.
+            seq = [
+                ("roll IZQUIERDA (ch0-)", (1024 - d, 1024, 1024, 1024)),
+                ("roll DERECHA (ch0+)",   (1024 + d, 1024, 1024, 1024)),
+                ("pitch FRENTE (ch1+)",   (1024, 1024 + d, 1024, 1024)),
+                ("pitch ATRAS (ch1-)",    (1024, 1024 - d, 1024, 1024)),
+                ("yaw DERECHA (ch3+)",    (1024, 1024, 1024, 1024 + d)),
+                ("yaw IZQUIERDA (ch3-)",  (1024, 1024, 1024, 1024 - d)),
+            ]
+            print("   DEMO (deflexion=%d, %.1fs por movimiento)" % (d, secs), flush=True)
+            for lbl, sticks in seq:
+                self._fly_loop(sticks,  secs,  label="   " + lbl)
+                self._fly_loop(NEUTRAL, brake, label="   centro (freno)")
+            return
         if name == "yaw":
             a, b = (1024, 1024, 1024, 1024 + d), (1024, 1024, 1024, 1024 - d)
             la, lb = "yaw (ch3+): giro derecha", "yaw (ch3-): giro izquierda (igual, vuelve)"
@@ -460,9 +476,10 @@ def main():
                     default="throttle",
                     help="throttle: descenso por throttle-min (EXP-027, por defecto); "
                          "auto: AUTO_LANDING 0x03/0x2a:02 (no baja al Neo, solo comparacion)")
-    ap.add_argument("--maneuver", choices=("none", "yaw", "forward", "roll"), default="none",
-                    help="movimiento direccional tras el hover (EXP-028). yaw=giro en sitio "
-                         "(el mas seguro), forward=cabeceo, roll=alabeo. Va y vuelve. none=solo sube/baja")
+    ap.add_argument("--maneuver", choices=("none", "yaw", "forward", "roll", "demo"), default="none",
+                    help="movimiento direccional tras el hover (EXP-028). yaw=giro, forward=cabeceo, "
+                         "roll=alabeo (van y vuelven); demo=secuencia izq/der/frente/atras/giro-der/giro-izq. "
+                         "none=solo sube/baja")
     ap.add_argument("--move-secs", dest="move_secs", type=float, default=2.0,
                     help="duracion de CADA tramo de la maniobra (ida = vuelta, para volver al "
                          "inicio). OJO: en forward/roll mas segundos = mas distancia recorrida")
