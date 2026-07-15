@@ -31,3 +31,7 @@ data/raw/*.mp4
 data/raw/*.mov
 data/raw/*.srt
 Videos/
+
+# Video crudo capturado del Neo (grande, regenerable)
+*.h265
+frames/
