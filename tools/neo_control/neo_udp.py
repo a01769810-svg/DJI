@@ -396,6 +396,24 @@ def scan_duml(pkt):
     return _scan_frames(pkt)
 
 
+# --- Arranque del STREAM DE VIDEO (EXP-030) ---
+# El video (paquetes type-0x02 en 9003) NO fluye solo al enganchar: la app lo pide con
+# comandos de CAMARA (cset 0x02, rcv=0x01, snd=0x02) ENVUELTOS en 0x51/01. Frames verbatim
+# de 'Septima prueba' (sesion CON video en tierra). Se replican como el INIT. 🧪 EXP.
+#   0xd8 (~2.7/s) y 0xe8 (~1.6/s): streams continuos desde el arranque.
+#   0xb5 (una vez) y 0xeb (~2/s): candidatos a iniciar/mantener el stream.
+CAM_D8 = bytes.fromhex("551604fc0201efc64002d801000000000000000009fb")
+CAM_E8 = bytes.fromhex("550d04330201f2c64002e89f50")
+CAM_B5 = bytes.fromhex("5511049202010eca4002b500000000bf4d")
+CAM_EB = bytes.fromhex("551e048a0201cbc94002eb00ff0b112700000a00030008007517d10722a9")
+
+def request_iframe_frame(dseq):
+    """0x02/0xb3 Request IFrame — pide un KEYFRAME (IDR + VPS/SPS/PPS). Necesario si nos
+    colgamos al stream a mitad (solo P-frames): sin keyframe no se puede decodificar.
+    snd=0x02 rcv=0x01 (camara) attr=0x40, payload vacio. EXP-031."""
+    return mb_frame(0x02, 0x01, dseq, 0x40, 0x02, 0xb3, b"")
+
+
 # --- Gimbal Push Position 0x04/0x05: angulo de la CAMARA (EXP-029) ---
 # Layout autoritativo (dji-firmware-tools, gimbal_params_dissector):
 #   @0 pitch int16 x0.1 grados (0=camara al frente, NEGATIVO=abajo, POSITIVO=arriba;
