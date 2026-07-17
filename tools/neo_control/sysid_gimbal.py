@@ -1,0 +1,441 @@
+r"""
+sysid_gimbal.py — IDENTIFICACION DEL GIMBAL (tilt de camara) del DJI Neo, EN TIERRA.
+
+POR QUE ES DISTINTO DEL YAW (leer antes de tocar nada):
+  1. TODO EN TIERRA, SIN VOLAR. Inclinar la camara NO toca los motores (0x04/0x01 va al
+     modulo gimbal, no al FC de vuelo). No hay --fly aqui: esta herramienta NO PUEDE
+     despegar. Sin bateria en juego, sin riesgo -> se puede repetir gratis.
+  2. EL GIMBAL TIENE TOPES MECANICOS. El yaw giraba libre y un PRBS bang-bang podia
+     deambular sin consecuencias. Aqui, si la excursion supera el recorrido, el PRBS se
+     estampa contra el limite y NO mide nada (un motor empujando una pared) ademas de
+     castigar el mecanismo. Por eso:
+       - FASE 0 mide los topes ANTES de nada (empujando suave y parando en cuanto el
+         angulo deja de responder).
+       - La amplitud del PRBS se calcula CON LOS DATOS REALES de la FASE A, no a ojo.
+
+LA PLANTA (misma forma que el yaw, EXP-034/035):
+  0x04/0x01 es un comando de VELOCIDAD (uint16 en 363..1685; 1024=quieta, <1024=abajo,
+  >1024=arriba). El feedback 0x04/0x05 da el ANGULO (gpitch, int16/10 => 0.1 deg).
+  Luego:  cmd --> rate --[1/s]--> angulo  = INTEGRADOR, igual que el stick de yaw.
+  => Al ser integrador, un P/PD ya da error nulo a escalon: la I sobra (en el yaw la I
+     costo 12.5% de overshoot y un ciclo limite; ver EXP-036).
+
+MUESTREO: el Push Position 0x04/0x05 llega a 9.90 Hz (medido sobre 'Novena captura.pcap':
+679 paquetes / 68.5 s) => Ts = 100 ms, el MISMO que el OSD, y por el mismo motivo no se
+puede subir: es la tasa a la que el dron reporta.
+
+EXCURSION DEL PRBS: la suma acumulada de una m-secuencia de 7 bits esta ACOTADA en +-7
+bits (no hace random walk). Luego la excursion es predecible:
+      excursion = rate(amplitud) * Tb * 7
+y se dimensiona para que quepa holgada en el recorrido medido en la FASE 0.
+
+SECUENCIA
+  FASE 0  topes: empuja suave abajo hasta que gpitch deja de moverse, luego arriba. Da el
+          RECORRIDO real y el centro. Para en cuanto no responde (no insiste contra el tope).
+  FASE A  barridos: para cada nivel |u|, barre de un extremo al otro y mide la velocidad
+          estacionaria en el tramo central -> CURVA ESTATICA (rate vs comando). El barrido
+          hace ping-pong solo, asi que la guarda contra los topes es intrinseca.
+  FASE B  PRBS bang-bang centrado, con la amplitud CALCULADA de la FASE A para que la
+          excursion quepa en el recorrido. -> DINAMICA / retardo.
+
+USO
+  .\neo.ps1 sysid_gimbal.py --probe     SOLO la FASE 0 (topes). La primera vez, correr esto.
+  .\neo.ps1 sysid_gimbal.py             completo: topes + barridos + PRBS -> sysid_gimbal.csv
+  .\.venv\Scripts\python tools\neo_control\sysid_gimbal.py --export sysid_gimbal.csv
+Ctrl+C = para y centra la camara.
+"""
+import argparse, csv, os, sys, time, socket
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import neo_udp as N
+import flight as F
+from sysid_yaw import prbs7
+
+TS = 0.1                 # impuesto por el Push Position 0x04/0x05 (9.90 Hz medido)
+CENTER = 1024            # 0x04/0x01: 1024 = quieta
+MAX_CMD = 660            # rango 363..1685 => +-660 sobre el centro (mismo que el stick)
+PRBS_EXC = 7             # excursion acotada de una m-secuencia de 7 bits, en bits
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class Gimbal:
+    """Envia velocidad al gimbal y lee su angulo, manteniendo viva la sesion.
+    NO toca los motores de vuelo: 0x04/0x01 va al modulo gimbal."""
+
+    def __init__(self, f):
+        self.f = f
+        self.nt = {"cmd": 0.0, "sub": 0.0, "ka": 0.0}
+        self.gp = None            # ultimo gpitch leido
+        self.t_gp = None
+
+    def pump(self, u):
+        """Manda 'u' (deflexion sobre 1024) a ~10Hz y drena el downlink.
+        Devuelve (gpitch, t) si llego una muestra NUEVA, o (None, None)."""
+        now = time.time()
+        if self.f.serial and now >= self.nt["sub"]:
+            self.f.sub13(); self.nt["sub"] = now + 0.2
+        if now >= self.nt["ka"]:
+            self.f.s.keepalive(); self.nt["ka"] = now + 0.5
+        if now >= self.nt["cmd"]:
+            self.f.gimbal_rate(CENTER + int(clamp(u, -MAX_CMD, MAX_CMD)))
+            self.nt["cmd"] = now + TS
+        self.f.s.sock.settimeout(0.02)
+        try:
+            d, a = self.f.s.sock.recvfrom(65535)
+        except (socket.timeout, BlockingIOError):
+            return None, None
+        if not (d and a[0] == N.DRONE[0]):
+            return None, None
+        g = N.find_gimbal_position(d)
+        if not g:
+            return None, None
+        self.gp, self.t_gp = g["gpitch"], time.time()
+        return self.gp, self.t_gp
+
+    def hold(self, secs, u=0):
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            self.pump(u)
+        return self.gp
+
+    def wait_reading(self, secs=4.0):
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            g, _ = self.pump(0)
+            if g is not None:
+                return g
+        return None
+
+
+# ------------------------------------------------------------------ FASE 0: topes
+def find_limit(gb, u, args, samples, label):
+    """Empuja a velocidad 'u' hasta que el angulo DEJA DE MOVERSE => tope mecanico.
+    Para en cuanto no responde: NO insiste contra el tope. Devuelve el angulo del tope."""
+    t0 = time.time()
+    last_move = time.time()
+    last = gb.gp
+    while time.time() - t0 < args.limit_timeout:
+        g, t = gb.pump(u)
+        if g is None:
+            continue
+        samples.append(dict(t_s=round(time.time() - args.t0, 4), u_cmd=int(u),
+                            phase="LIMIT_" + label, gpitch=g))
+        if last is None or abs(g - last) > args.still_deg:
+            last_move = time.time(); last = g
+        elif time.time() - last_move > args.still_secs:
+            print("   tope %s en %.1f deg (dejo de moverse %.1fs)" % (label, g, args.still_secs),
+                  flush=True)
+            gb.hold(0.3, 0)                       # suelta: no seguir empujando contra el tope
+            return g
+    print("   !! %s: no encontro tope en %.0fs (angulo %.1f) — se usa este valor"
+          % (label, args.limit_timeout, gb.gp), flush=True)
+    gb.hold(0.3, 0)
+    return gb.gp
+
+
+def goto(gb, target, args, samples, tol=1.5, timeout=10.0):
+    """Lleva la camara a 'target' con un P sencillo (el esquema de point_camera).
+    Solo para posicionar entre fases; no se identifica con esto.
+
+    OJO: UN SOLO pump() por vuelta. pump() solo transmite en su ranura de 10Hz, asi que
+    llamarlo dos veces (una para leer, otra para mandar) es una CARRERA: gana la primera
+    y si esa mandaba 0 la camara no se mueve. Ese bug dejaba el PRBS sin centrar y lo
+    estampaba contra el tope."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        g = gb.gp                                  # ultima lectura conocida (no consume ranura)
+        if g is None:
+            gb.pump(0)
+            continue
+        err = target - g
+        if abs(err) <= tol:
+            gb.hold(0.2, 0)
+            return g
+        u = clamp(abs(err) * 40, 130, 400)
+        gnew, t = gb.pump(u if err > 0 else -u)    # <- el UNICO pump de la vuelta
+        if gnew is not None:
+            samples.append(dict(t_s=round(t - args.t0, 4), u_cmd=0,
+                                phase="GOTO", gpitch=gnew))
+    print("   !! goto(%.1f) no llego: se quedo en %.1f" % (target, gb.gp or 0), flush=True)
+    return gb.gp
+
+
+# ------------------------------------------------------------------ FASE A: barridos
+def sweep(gb, u, lo, hi, args, samples):
+    """Barre a velocidad constante 'u' de un extremo al otro, parando ANTES del tope.
+    Devuelve la velocidad estacionaria medida en el tramo CENTRAL (ignora arranque y
+    frenado). Es la curva estatica: rate vs comando."""
+    m = args.margin
+    tgt_lo, tgt_hi = lo + m, hi - m
+    pts = []
+    t0 = time.time()
+    while time.time() - t0 < args.sweep_timeout:
+        g, t = gb.pump(u)
+        if g is None:
+            continue
+        pts.append((t, g))
+        samples.append(dict(t_s=round(t - args.t0, 4), u_cmd=int(u),
+                            phase="SWEEP%+d" % u, gpitch=g))
+        if (u > 0 and g >= tgt_hi) or (u < 0 and g <= tgt_lo):
+            break
+    gb.hold(0.2, 0)
+    if len(pts) < 6:
+        return None
+    # velocidad por regresion sobre el 60% CENTRAL (fuera transitorios de arranque/parada)
+    a, b = int(len(pts) * 0.2), int(len(pts) * 0.8)
+    seg = pts[a:b]
+    if len(seg) < 4:
+        return None
+    ts = [p[0] - seg[0][0] for p in seg]
+    gs = [p[1] for p in seg]
+    n = len(seg)
+    mt, mg = sum(ts) / n, sum(gs) / n
+    den = sum((x - mt) ** 2 for x in ts)
+    if den <= 0:
+        return None
+    return sum((ts[i] - mt) * (gs[i] - mg) for i in range(n)) / den   # deg/s
+
+
+# ------------------------------------------------------------------ main
+def run(args):
+    args.t0 = time.time()
+    samples = []
+    print("=" * 68)
+    print("  sysid_gimbal.py — IDENTIFICACION DEL GIMBAL (EN TIERRA, sin volar)")
+    print("  Ts = 100ms (Push Position 0x04/0x05 a 9.90 Hz)  |  cmd 363..1685, centro 1024")
+    print("  Esta herramienta NO despega: 0x04/0x01 va al gimbal, no al FC de vuelo.")
+    print("=" * 68)
+
+    s = N.Type5Session()
+    if not s.open():
+        print("!! sin ACK al hello -> revisa WiFi del Neo / DJI Fly cerrado."); return
+    print("hello -> ACK. Sesion abierta.")
+    f = F.Flight(s, None, None)
+    gb = Gimbal(f)
+    try:
+        print("enviando init (%d frames)..." % len(F.INIT))
+        for fr in F.INIT:
+            f.s.send_command(fr); time.sleep(0.03)
+        ok = f.engage()
+        print(">>> ENGANCHE 0x51: %s" % ("OK" if ok else "FALLO (sin serial)"), flush=True)
+
+        g0 = gb.wait_reading()
+        if g0 is None:
+            print("!! no llega el Push Position 0x04/0x05. Abortado."); return
+        print("angulo inicial: %.1f deg" % g0, flush=True)
+
+        # ---------------- FASE 0: topes ----------------
+        print("\n1) FASE 0 — topes mecanicos (empuje suave, para al no responder)...", flush=True)
+        lo = find_limit(gb, -args.probe_u, args, samples, "ABAJO")
+        hi = find_limit(gb, +args.probe_u, args, samples, "ARRIBA")
+        travel = hi - lo
+        center = (hi + lo) / 2.0
+        print(">>> RECORRIDO: %.1f .. %.1f  = %.1f deg de rango  (centro %.1f)"
+              % (lo, hi, travel, center), flush=True)
+        if travel < 10:
+            print("!! recorrido absurdo (%.1f deg). ¿El gimbal esta trabado? Abortado." % travel)
+            return
+        if args.probe:
+            print("\n--probe: solo los topes. Fin.")
+            return
+
+        # ---------------- FASE A: barridos ----------------
+        print("\n2) FASE A — barridos (curva estatica: velocidad vs comando)...", flush=True)
+        levels = [int(x) for x in args.levels.split(",") if x.strip()]
+        curve = {}
+        for L in levels:
+            goto(gb, lo + args.margin + 2, args, samples)
+            r_up = sweep(gb, +L, lo, hi, args, samples)
+            goto(gb, hi - args.margin - 2, args, samples)
+            r_dn = sweep(gb, -L, lo, hi, args, samples)
+            curve[L] = (r_up, r_dn)
+            print("   u=%+4d -> subiendo %s  |  u=%+4d -> bajando %s"
+                  % (L, ("%.1f deg/s" % r_up) if r_up else "?",
+                     -L, ("%.1f deg/s" % r_dn) if r_dn else "?"), flush=True)
+
+        # ---------------- FASE B: PRBS dimensionado con los datos de arriba ----------------
+        usable = [(L, (abs(u) + abs(d)) / 2) for L, (u, d) in curve.items() if u and d]
+        if not usable:
+            print("!! la FASE A no midio ninguna velocidad. Sin PRBS.");
+        elif args.prbs_bits > 0:
+            print("\n3) FASE B — PRBS, amplitud calculada del recorrido REAL...", flush=True)
+            room = travel / 2.0 - args.margin                  # espacio a cada lado del centro
+            best = None
+            for L, rate in sorted(usable):
+                exc = rate * args.prbs_bit_secs * PRBS_EXC     # excursion acotada de la m-seq
+                fits = exc <= room * args.exc_frac
+                print("   u=%+4d: rate %.1f deg/s -> excursion %.1f deg  (cabe en %.1f? %s)"
+                      % (L, rate, exc, room * args.exc_frac, "SI" if fits else "no"), flush=True)
+                if fits:
+                    best = (L, rate, exc)
+            if best is None:
+                print("   !! ni el nivel mas bajo cabe. Baja --prbs-bit-secs o sube --levels.")
+            else:
+                amp, rate, exc = best
+                print(">>> PRBS: amplitud %+d (rate %.1f deg/s), excursion prevista %.1f deg"
+                      " sobre %.1f de sitio" % (amp, rate, exc, room), flush=True)
+                gc = goto(gb, center, args, samples)
+                gb.hold(1.0, 0)
+                # NO arrancar sin estar centrado: desde otro sitio la excursion calculada
+                # ya no cabe y el PRBS acaba contra el tope (fue exactamente el bug del
+                # goto con doble pump).
+                if gc is None or abs(gc - center) > 5.0:
+                    print("   !! no se pudo centrar (%.1f vs %.1f): PRBS ABORTADO para no"
+                          " estampar el gimbal." % (gc or 0, center), flush=True)
+                else:
+                    bits = prbs7(args.prbs_bits)
+                    n_guard = 0
+                    for i, b in enumerate(bits):
+                        u = amp * b
+                        t_end = time.time() + args.prbs_bit_secs
+                        while time.time() < t_end:
+                            # GUARDA DURA: cerca de un tope, no empujar MAS hacia el. Se
+                            # modifica el comando; NO se hace un pump extra (seria la misma
+                            # carrera de antes).
+                            g = gb.gp
+                            u_eff = u
+                            if g is not None and ((u > 0 and g > hi - args.margin)
+                                                  or (u < 0 and g < lo + args.margin)):
+                                u_eff = 0; n_guard += 1
+                            gnew, t = gb.pump(u_eff)      # <- el UNICO pump de la vuelta
+                            if gnew is not None:
+                                samples.append(dict(t_s=round(t - args.t0, 4), u_cmd=int(u_eff),
+                                                    phase="PRBS", gpitch=gnew))
+                        if i % 20 == 0:
+                            print("   PRBS %3d/%d  gpitch=%.1f" % (i, len(bits), gb.gp or 0),
+                                  flush=True)
+                    if n_guard:
+                        print("   (la guarda de topes actuo en %d muestras)" % n_guard, flush=True)
+        print("\n4) centrando la camara...", flush=True)
+        goto(gb, center, args, samples)
+        gb.hold(0.5, 0)
+    except KeyboardInterrupt:
+        print("\n!! Ctrl+C -> parando y centrando", flush=True)
+        try:
+            gb.hold(0.5, 0)
+        except Exception:
+            pass
+    finally:
+        if s.sock:
+            s.sock.close()
+
+    if samples:
+        with open(args.out, "w", newline="", encoding="utf-8") as fh:
+            fh.write("# fecha: %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            fh.write("# Ts_nominal_s: 0.1 (Push Position 0x04/0x05 ~9.9Hz)\n")
+            fh.write("# signo: u_cmd + = ARRIBA (gpitch sube); - = ABAJO\n")
+            fh.write("# comando_enviado: 1024 + u_cmd (0x04/0x01, rango 363..1685)\n")
+            w = csv.DictWriter(fh, fieldnames=["t_s", "u_cmd", "phase", "gpitch"])
+            w.writeheader(); w.writerows(samples)
+        print(">>> CSV: %d muestras -> %s" % (len(samples), args.out))
+        print(">>> Exporta:  .\\.venv\\Scripts\\python tools\\neo_control\\sysid_gimbal.py"
+              " --export %s" % args.out)
+
+
+def export_xlsx(csv_path, xlsx_path, ts=TS):
+    """CSV -> Excel. Hoja 'datos' = 3 columnas (tiempo, entrada, salida) en rejilla uniforme.
+    El gimbal NO envuelve, asi que la salida va tal cual (sin des-envolver)."""
+    import numpy as np
+    from openpyxl import Workbook
+    meta, body = {}, []
+    for ln in open(csv_path, encoding="utf-8"):
+        if ln.startswith("#"):
+            k, _, v = ln[1:].partition(":"); meta[k.strip()] = v.strip()
+        else:
+            body.append(ln)
+    rows = list(csv.DictReader(body))
+    if not rows:
+        print("!! el CSV no tiene muestras"); return
+    t = np.array([float(r["t_s"]) for r in rows])
+    u = np.array([float(r["u_cmd"]) for r in rows])
+    g = np.array([float(r["gpitch"]) for r in rows])
+    ph = [r["phase"] for r in rows]
+
+    wb = Workbook()
+    ws = wb.active; ws.title = "datos"
+    grid = np.arange(t[0], t[-1], ts)
+    g_g = np.interp(grid, t, g)
+    idx = np.clip(np.searchsorted(t, grid, side="right") - 1, 0, len(u) - 1)
+    u_g = u[idx]; ph_g = [ph[i] for i in idx]
+    ws.append(["tiempo_s", "entrada_u", "salida_gpitch_deg"])
+    for i in range(len(grid)):
+        ws.append([round(float(grid[i]), 3), int(u_g[i]), round(float(g_g[i]), 3)])
+    for c, w_ in (("A", 12), ("B", 12), ("C", 18)):
+        ws.column_dimensions[c].width = w_
+
+    ws = wb.create_sheet("info")
+    sw = [r for r in rows if r["phase"].startswith("SWEEP")]
+    info = [
+        ("QUE ES ESTO", "Identificacion del GIMBAL (tilt de camara) del DJI Neo. TODO EN TIERRA."),
+        ("", ""),
+        ("  tiempo_s", "paso FIJO %.3f s. IMPUESTO por el Push Position 0x04/0x05 (9.90 Hz)" % ts),
+        ("  entrada_u", "deflexion sobre el centro. El comando enviado es 1024 + entrada_u"),
+        ("", "(0x04/0x01, rango fisico 363..1685). SIGNO: + = ARRIBA, - = ABAJO."),
+        ("  salida_gpitch_deg", "angulo de la camara. 0 = al frente, negativo = mirando abajo."),
+        ("", "Resolucion 0.1 deg (int16/10). NO envuelve: es un eje con TOPES."),
+        ("", ""),
+        ("MODELO ESPERADO", "cmd --> rate --[1/s]--> angulo  = INTEGRADOR (igual que el yaw)."),
+        ("", "0x04/0x01 es un comando de VELOCIDAD: 1024 = quieta."),
+        ("", "Al ser integrador, un P/PD ya da error nulo a escalon: la I SOBRA."),
+        ("", "En el yaw la I costo 12.5% de overshoot y un ciclo limite (EXP-036)."),
+        ("", ""),
+        ("OJO — TOPES", "a diferencia del yaw, este eje tiene limite mecanico. Las fases"),
+        ("", "LIMIT_* son la busqueda de topes; ignorarlas al identificar."),
+        ("FASE SWEEP*", "barridos a velocidad constante -> curva estatica (rate vs comando)."),
+        ("FASE PRBS", "excitacion rica -> dinamica/retardo. Amplitud dimensionada para que"),
+        ("", "la excursion (rate*Tb*7, acotada en la m-secuencia) quepa en el recorrido."),
+        ("FASE GOTO", "reposicionamiento entre fases. NO identificar con esto (es lazo cerrado)."),
+        ("", ""),
+    ]
+    for k, v in meta.items():
+        info.append(("meta: " + k, v))
+    for r in info:
+        ws.append(list(r))
+    ws.column_dimensions["A"].width = 20; ws.column_dimensions["B"].width = 92
+
+    ws = wb.create_sheet("raw")
+    ws.append(["t_s", "u_cmd", "phase", "gpitch", "dt_s"])
+    for i, r in enumerate(rows):
+        ws.append([float(r["t_s"]), int(float(r["u_cmd"])), r["phase"], float(r["gpitch"]),
+                   round(t[i] - t[i - 1], 4) if i else 0.0])
+    wb.save(xlsx_path)
+    print(">>> Excel: %d crudas, %d en rejilla de %.0f ms -> %s"
+          % (len(rows), len(grid), ts * 1000, xlsx_path))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Identificacion del gimbal del Neo (EN TIERRA)")
+    ap.add_argument("--probe", action="store_true", help="SOLO la FASE 0 (topes). Correr esto primero")
+    ap.add_argument("--export", metavar="CSV", default=None, help="CSV -> .xlsx (usa el .venv)")
+    ap.add_argument("--out", default="sysid_gimbal.csv")
+    # FASE 0
+    ap.add_argument("--probe-u", dest="probe_u", type=float, default=250.0,
+                    help="velocidad para buscar los topes. SUAVE a proposito")
+    ap.add_argument("--still-deg", dest="still_deg", type=float, default=0.15,
+                    help="movimiento por debajo del cual se considera 'quieto' (tope)")
+    ap.add_argument("--still-secs", dest="still_secs", type=float, default=0.7,
+                    help="segundos quieto para declarar tope")
+    ap.add_argument("--limit-timeout", dest="limit_timeout", type=float, default=12.0)
+    ap.add_argument("--margin", type=float, default=6.0,
+                    help="grados de respeto a los topes: NUNCA se empuja dentro de este margen")
+    # FASE A
+    ap.add_argument("--levels", default="100,200,300,400,500,660",
+                    help="niveles |u| de los barridos (se hacen + y -)")
+    ap.add_argument("--sweep-timeout", dest="sweep_timeout", type=float, default=12.0)
+    # FASE B
+    ap.add_argument("--prbs-bits", dest="prbs_bits", type=int, default=127, help="0 = sin PRBS")
+    ap.add_argument("--prbs-bit-secs", dest="prbs_bit_secs", type=float, default=0.3,
+                    help="periodo de bit. Con Ts=0.1 son 3 muestras/bit: no bajar de 0.2")
+    ap.add_argument("--exc-frac", dest="exc_frac", type=float, default=0.7,
+                    help="fraccion del sitio disponible que puede ocupar la excursion del PRBS")
+    args = ap.parse_args()
+    if args.export:
+        export_xlsx(args.export, os.path.splitext(args.export)[0] + ".xlsx"); return
+    run(args)
+
+
+if __name__ == "__main__":
+    main()
