@@ -14,13 +14,29 @@ $ErrorActionPreference = "Continue"
 $neoSsid  = "DJI-NEO-8499"
 $homeSsid = "depaez_5G"
 
-# 1er argumento puede ser un script .py; si no, se usa flight.py
+# 1er argumento: si NO es una opcion (-algo), es el nombre del script y DEBE EXISTIR.
+#
+# ANTES el test era `$rest[0] -like "*.py"` y si no casaba se caia a flight.py EN SILENCIO.
+# Eso es peligroso: flight.py es el programa de VUELO. Un typo en el nombre lanzaba otra
+# cosa sin avisar, y con los flags de armado detras el dron DESPEGA:
+#     .\neo.ps1 gimbal_pd.py --fly --armed-ok   ->  python flight.py --fly --armed-ok
+# (Paso de verdad con un pegado duplicado: "gimbal_pid.py.\neo.ps1" no termina en .py,
+#  no caso el patron, y corrio flight.py.)
+# Ahora: cualquier primer argumento que no empiece por "-" se trata como script y si no
+# existe se ABORTA. Nunca se cae a flight.py por accidente.
 $rest = @($args)
 $script = "flight.py"
-if ($rest.Count -gt 0 -and $rest[0] -like "*.py") {
+if ($rest.Count -gt 0 -and $rest[0] -notlike "-*") {
     $script = $rest[0]
     # OJO: $rest[1..($n-1)] con n=1 da el rango DESCENDENTE 1..0 y reinyecta $rest[0].
     if ($rest.Count -gt 1) { $rest = $rest[1..($rest.Count - 1)] } else { $rest = @() }
+    if (-not (Test-Path (Join-Path $PSScriptRoot $script))) {
+        Write-Host "ERROR: no existe el script '$script' en $PSScriptRoot" -ForegroundColor Red
+        Write-Host "       NO se cae a flight.py: un typo no debe lanzar el programa de VUELO." -ForegroundColor Red
+        Write-Host "       Scripts disponibles:" -ForegroundColor Yellow
+        Get-ChildItem -Path $PSScriptRoot -Filter *.py | ForEach-Object { Write-Host "         $($_.Name)" }
+        return
+    }
 }
 $scriptPath = Join-Path $PSScriptRoot $script
 
