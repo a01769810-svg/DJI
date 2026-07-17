@@ -472,7 +472,14 @@ def export_xlsx(csv_path, xlsx_path, ts=TS):
     if m.sum() > 20:
         i0, i1 = int(np.argmax(m)), len(m) - int(np.argmax(m[::-1]))
         gp_seg = g_g[i0:i1]
-        rate_out = np.gradient(gp_seg, ts)                       # velocidad medida
+        # DIFERENCIA HACIA ATRAS (CAUSAL): rate[k] = (g[k]-g[k-1])/Ts.
+        # NO np.gradient: es diferencia CENTRAL, usa g[k+1] => MIRA AL FUTURO y adelanta la
+        # señal media muestra. Con gradient, el ajuste del usuario encajaba mejor con
+        # retardo CERO (fit 76.3%) que con el retardo real -> el modelo salia con menos
+        # retardo del que hay, y un PID diseñado asi tiene menos margen de fase del que
+        # cree. Es como aparecio el ciclo limite del yaw (EXP-035). Ya estaba documentado
+        # en el yaw y se repitio igual.
+        rate_out = np.concatenate([[0.0], np.diff(gp_seg) / ts])
         rate_in = r_lin[i0:i1]                                   # velocidad comandada
         tt = grid[i0:i1] - grid[i0]
         ws.append(["tiempo_s", "entrada_rate_deg_s", "salida_rate_deg_s"])
