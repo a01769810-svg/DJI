@@ -192,12 +192,20 @@ def simulate(args):
     print()
     for rel, hold in tg:
         sp_abs = wrap180(sp_abs + rel)
-        pid.I = pid.I                                  # (la I se conserva entre tramos)
+        sp_cmd = yaw                                   # con --ramp el setpoint se rampea
         t_end = t + hold
         t_start = t
         reached = None
         while t < t_end:
-            u, e, P, I, D = pid.step(sp_abs, yaw)
+            # misma rampa que el vuelo real (pid_loop): limita la DEMANDA, no la autoridad
+            if args.ramp:
+                d = wrap180(sp_abs - sp_cmd)
+                step_max = args.ramp * TS
+                sp_cmd = wrap180(sp_cmd + max(-step_max, min(step_max, d)))
+                target = sp_cmd
+            else:
+                target = sp_abs
+            u, e, P, I, D = pid.step(target, yaw)
             ud.append(u); ud.pop(0)
             u_eff = (1 - frac) * ud[-2] + frac * ud[-3]   # retardo fraccionario 1.55
             yaw = wrap180(yaw + TS * plant_rate(u_eff))
