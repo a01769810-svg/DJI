@@ -55,8 +55,25 @@ NEUTRAL = F.NEUTRAL
 MAX_DEFL = 660          # rango real del stick: 364..1684, centro 1024 (flight.py:92)
 TS = 0.1                # impuesto por el OSD (9.86 Hz). No se puede subir.
 
-# --- ganancias del usuario (diseño en la idtf de EXP-034) ---
+# --- ganancias del usuario (diseño en la idtf de EXP-034); ajustables con --kp/--ki/--kd ---
 KP, KI, KD = 121.251465320811, 95.1967343212135, 7.33540859003448
+
+# LA PLANTA DEL USUARIO (idtf ajustada a EXP-034), Ts=0.1:
+#   G(z) = (0.005528574590918 z - 0.005430130906281) / (z^2 - 1.986780377356632 z + 0.986787771673030)
+# Analisis: polos en 0.999415 y 0.987366, cero en 0.982194. El cero casi CANCELA el polo
+# rapido => G(z) ~ 0.0055286/(z - 0.999415): un INTEGRADOR (la fuga tiene tau=171 s, o sea
+# nada). Ganancia equivalente 0.0553 deg/s por unidad de stick (mi minimos cuadrados sobre
+# la curva estatica daba 0.0683; la diferencia es el EXPO: todo ajuste lineal depende de
+# la amplitud). Relative degree 1 => 1 muestra de retardo ya dentro del modelo (el real
+# son 1.5, EXP-035).
+#
+# KI=0 ES LA MEJOR JUGADA (barrido sobre esa G, con el retardo real de 1.5 muestras):
+#     Kp=121.25 Ki=95.20 Kd=7.34  -> overshoot 12.53%  settling 3.0s   (el diseño original)
+#     Kp=121.25 Ki=0     Kd=7.34  -> overshoot  0.66%  settling 0.8s   <-- 19x menos, 4x mas rapido
+#     Kp=10     Ki=0     Kd=13.75 -> overshoot  0.41%  settling 9.8s   (minimo absoluto: NO COMPENSA)
+# Como la planta YA es un integrador, la I no compra error nulo (ya lo hay) y solo cuesta
+# fase. El suelo de overshoot es 0.42% y lo impone el CERO de la planta (0.982), no el PID.
+GAINS_MIN_OS = (121.251465320811, 0.0, 7.33540859003448)
 
 # --- planta identificada en EXP-034 (para --sim) ---
 EXPO_A, EXPO_N = 49.5, 1.351      # rate = A*(|u|/660)^N deg/s
@@ -172,9 +189,9 @@ def build_targets(args):
 
 # ------------------------------------------------------------------ simulacion
 def simulate(args):
-    """Lazo cerrado contra la planta de EXP-034: expo + integrador + 1 muestra de retardo
-    + SATURACION. Sirve para ver el comportamiento REAL (no lineal) antes de volar."""
-    pid = YawPID()
+    """Lazo cerrado contra la planta de EXP-034: expo + integrador + retardo + SATURACION.
+    Sirve para ver el comportamiento REAL (no lineal) antes de volar."""
+    pid = YawPID(args.kp, args.ki, args.kd)
     tg = build_targets(args)
     yaw = 0.0
     sp_abs = 0.0
@@ -188,7 +205,8 @@ def simulate(args):
     frac = DELAY_S / TS - 1.0                      # parte fraccionaria sobre u[k-1]
     print("SIM: planta EXP-034 (expo %.1f/(x)^%.3f, sat +-%d, %d ms de retardo)"
           % (EXPO_A, EXPO_N, MAX_DEFL, TS * 1000))
-    print("     PID Kp=%.2f Ki=%.2f Kd=%.3f  Ts=%.0fms" % (KP, KI, KD, TS * 1000))
+    print("     PID Kp=%.2f Ki=%.2f Kd=%.3f  Ts=%.0fms%s"
+          % (args.kp, args.ki, args.kd, TS * 1000, "   [Ki=0: minimo overshoot]" if args.ki == 0 else ""))
     print()
     for rel, hold in tg:
         sp_abs = wrap180(sp_abs + rel)
@@ -237,7 +255,7 @@ def simulate(args):
 def pid_loop(f, args, log):
     """Lazo cerrado real. El PID recalcula SOLO al llegar OSD nuevo (~10Hz, es la medida);
     el stick se retransmite a 20Hz con el ultimo valor (ZOH) para no perder el enganche."""
-    pid = YawPID()
+    pid = YawPID(args.kp, args.ki, args.kd)
     tg = build_targets(args)
     nt = {"stick": 0.0, "mode": 0.0, "auth": 0.0, "ka": 0.0, "sub": 0.0, "rep": 0.0}
     u_hold = 0.0
@@ -365,9 +383,11 @@ def run(args):
     real = args.fly and args.armed_ok
     print("=" * 68)
     print("  yaw_pid.py — %s" % ("LAZO CERRADO REAL" if real else "DRY (no despega)"))
-    print("  Kp=%.3f  Ki=%.3f  Kd=%.5f  (sin filtro)  Ts=%.0fms" % (KP, KI, KD, TS * 1000))
+    print("  Kp=%.3f  Ki=%.3f  Kd=%.5f  (sin filtro)  Ts=%.0fms%s"
+          % (args.kp, args.ki, args.kd, TS * 1000,
+             "   [Ki=0 -> minimo overshoot]" if args.ki == 0 else ""))
     print("  objetivos: %+.0f deg ida/vuelta x2  |  satura si |err| > %.1f deg"
-          % (args.angle, MAX_DEFL / KP))
+          % (args.angle, MAX_DEFL / max(args.kp, 1e-9)))
     print("=" * 68)
     if args.fly and not args.armed_ok:
         print("!! --fly requiere --armed-ok."); return
@@ -418,6 +438,12 @@ def main():
     ap.add_argument("--armed-ok", dest="armed_ok", action="store_true")
     ap.add_argument("--sim", action="store_true", help="simula contra la planta de EXP-034 (sin dron)")
     ap.add_argument("--sim-csv", dest="sim_csv", default=None)
+    ap.add_argument("--kp", type=float, default=KP, help="ganancia proporcional")
+    ap.add_argument("--ki", type=float, default=KI,
+                    help="ganancia integral. --ki 0 baja el overshoot de 12.5%% a 0.66%% Y acelera "
+                         "el settling de 3.0s a 0.8s: la planta YA es un integrador, la I solo "
+                         "cuesta fase. RECOMENDADO")
+    ap.add_argument("--kd", type=float, default=KD, help="ganancia derivativa (sobre la MEDIDA)")
     ap.add_argument("--ramp", type=float, default=0.0, metavar="DEG_S",
                     help="rampa el setpoint a DEG_S deg/s en vez de saltar. 0 = escalon "
                          "(lo validado en EXP-035). La rampa mantiene el lazo FUERA de "
