@@ -412,31 +412,40 @@ def run(args):
 
     samples = []
     reason = "?"
-    sess = N.Session()
-    with sess:
-        if not sess.hello():
-            print("!! sin ACK al hello. ¿WiFi del Neo?"); return
-        f = F.Flight(sess, lat=args.lat, lon=args.lon)
+    # Type5Session (NO es context manager: se cierra a mano). Su send_command ya pacea a
+    # la ventana RX del dron y retransmite -> por eso esta herramienta se apoya en flight.py
+    # y no en el camino crudo de mapflight.py (ver EXP-032).
+    s = N.Type5Session()
+    if not s.open():
+        print("!! sin ACK al hello -> revisa WiFi del Neo / DJI Fly cerrado."); return
+    print("hello -> ACK. Sesion abierta (seed=0x%04x session=0x%04x)" % (s.seed, s.session))
+    f = F.Flight(s, args.lat, args.lon)
+    try:
         F.run_common(f, args)
-        try:
-            if real:
-                print("3) DESPEGUE (AUTO_FLY)...", flush=True)
-                f.auto_fly()
-                climb(f, args, samples)
-            else:
-                print("3) DRY: sin despegue; corriendo el plan con sticks NEUTRO.", flush=True)
-            print("4) EXCITACION (%.1fs)..." % plan_secs(segs), flush=True)
-            reason = sysid_loop(f, segs, real, args.alt_max, samples)
-            print(">>> plan terminado (%s)" % reason, flush=True)
-        except KeyboardInterrupt:
-            print("\n!! Ctrl+C -> ATERRIZANDO", flush=True)
-            reason = "ctrl-c"
-        finally:
-            if real:
-                print("5) ATERRIZAJE (throttle-min)...", flush=True)
+        if real:
+            print("3) DESPEGUE (AUTO_FLY)...", flush=True)
+            f.auto_fly()
+            climb(f, args, samples)
+        else:
+            print("3) DRY: sin despegue; corriendo el plan con sticks NEUTRO.", flush=True)
+        print("4) EXCITACION (%.1fs)..." % plan_secs(segs), flush=True)
+        reason = sysid_loop(f, segs, real, args.alt_max, samples)
+        print(">>> plan terminado (%s)" % reason, flush=True)
+    except KeyboardInterrupt:
+        print("\n!! Ctrl+C -> ATERRIZANDO", flush=True)
+        reason = "ctrl-c"
+    finally:
+        if real:
+            print("5) ATERRIZAJE (throttle-min)...", flush=True)
+            try:
                 ok = f.descend(args.land)
                 print(">>> touchdown %s" % ("CONFIRMADO" if ok else "NO confirmado (revisar)"),
                       flush=True)
+            except KeyboardInterrupt:
+                print("!! Ctrl+C durante el aterrizaje. Si sigue en el aire: boton del dron.",
+                      flush=True)
+        if s.sock:
+            s.sock.close()
 
     meta = {
         "fecha": time.strftime("%Y-%m-%d %H:%M:%S"),
