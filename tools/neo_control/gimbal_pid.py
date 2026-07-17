@@ -250,8 +250,12 @@ def run(args):
                     sp_eff = -sp * 0.5
                 u, e, P, I, D = pid.step(sp_eff, rate, dt)
                 u_hold = u
+                # OJO con el emparejamiento: 'stick' es el que YA se aplico (viene de
+                # u_pid_next de la fila ANTERIOR: el ZOH normal del lazo), y es el que
+                # produjo este 'rate_med' -> ese par es el correcto para analizar.
+                # 'u_pid_next' es el comando que se aplicara en la SIGUIENTE vuelta.
                 log.append(dict(t_s=round(tg - t0, 3), rate_sp=sp, rate_sp_eff=round(sp_eff, 2),
-                                rate_med=round(rate, 3), u_pid=round(u, 3),
+                                rate_med=round(rate, 3), u_pid_next=round(u, 3),
                                 stick=round(stick, 1), gpitch=g, err=round(e, 3),
                                 P=round(P, 3), I=round(I, 3), D=round(D, 3), sat=int(pid.sat)))
                 if time.time() >= nrep:
