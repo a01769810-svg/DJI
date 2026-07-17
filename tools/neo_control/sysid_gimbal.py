@@ -5,20 +5,30 @@ POR QUE ES DISTINTO DEL YAW (leer antes de tocar nada):
   1. TODO EN TIERRA, SIN VOLAR. Inclinar la camara NO toca los motores (0x04/0x01 va al
      modulo gimbal, no al FC de vuelo). No hay --fly aqui: esta herramienta NO PUEDE
      despegar. Sin bateria en juego, sin riesgo -> se puede repetir gratis.
-  2. EL GIMBAL TIENE TOPES MECANICOS. El yaw giraba libre y un PRBS bang-bang podia
-     deambular sin consecuencias. Aqui, si la excursion supera el recorrido, el PRBS se
-     estampa contra el limite y NO mide nada (un motor empujando una pared) ademas de
-     castigar el mecanismo. Por eso:
+  2. EL GIMBAL TIENE TOPES MECANICOS (-90 .. +60 en el Neo del usuario, y NUESTRO camino
+     los alcanza: la FASE A llego a -89.9 y a +56 antes de que cortara la guarda => misma
+     autoridad que la app). El yaw giraba libre y un PRBS podia deambular sin consecuencias.
+     Aqui, si la excursion supera el recorrido, el PRBS se queda pegado al limite y NO mide
+     nada. (Tocar un tope NO es peligroso: la FASE 0 conduce contra ellos a proposito, que
+     es lo mismo que hace la app al mantener la rueda de tilt. El coste es de DATOS.) Por eso:
        - FASE 0 mide los topes ANTES de nada (empujando suave y parando en cuanto el
          angulo deja de responder).
        - La amplitud del PRBS se calcula CON LOS DATOS REALES de la FASE A, no a ojo.
 
-LA PLANTA (misma forma que el yaw, EXP-034/035):
+LA PLANTA (MEDIDA, EXP-037). Se esperaba "igual que el yaw"; NO lo es:
   0x04/0x01 es un comando de VELOCIDAD (uint16 en 363..1685; 1024=quieta, <1024=abajo,
   >1024=arriba). El feedback 0x04/0x05 da el ANGULO (gpitch, int16/10 => 0.1 deg).
-  Luego:  cmd --> rate --[1/s]--> angulo  = INTEGRADOR, igual que el stick de yaw.
-  => Al ser integrador, un P/PD ya da error nulo a escalon: la I sobra (en el yaw la I
-     costo 12.5% de overshoot y un ciclo limite; ver EXP-036).
+  Hay integrador, si -- pero ademas:
+    - ZONA MUERTA (50) Y EXPO (n=1.704) A LA VEZ. Por eso fallan los modelos simples: la
+      potencia pura da R2=0.967 y la lineal+zona muerta R2=0.963; cada uno captura media
+      verdad. Juntos: R2=0.999998. (El yaw era expo PURO, sin zona muerta.)
+    - TAU=0.200 s OBSERVABLE (con tau R2=0.919, sin tau R2=0.322). En el yaw la diferencia
+      era 0.00006 -> alli tau no existia a efectos practicos.
+  => planta MAS DIFICIL que el yaw: polo extra en 0.6065 y ganancia local que varia x5.8
+     (el yaw solo x1.9).
+  => la I sigue sobrando (hay integrador; en el yaw costo 12.5% de overshoot y un ciclo
+     limite, EXP-036), la D aqui SI aporta (hay polo que amortiguar), y la INVERSION de
+     zona muerta+expo pasa de opcional (yaw) a RECOMENDADA -> hoja 'datos_lin'.
 
 MUESTREO: el Push Position 0x04/0x05 llega a 9.90 Hz (medido sobre 'Novena captura.pcap':
 679 paquetes / 68.5 s) => Ts = 100 ms, el MISMO que el OSD, y por el mismo motivo no se
@@ -32,9 +42,10 @@ y se dimensiona para que quepa holgada en el recorrido medido en la FASE 0.
 SECUENCIA
   FASE 0  topes: empuja suave abajo hasta que gpitch deja de moverse, luego arriba. Da el
           RECORRIDO real y el centro. Para en cuanto no responde (no insiste contra el tope).
-  FASE A  barridos: para cada nivel |u|, barre de un extremo al otro y mide la velocidad
-          estacionaria en el tramo central -> CURVA ESTATICA (rate vs comando). El barrido
-          hace ping-pong solo, asi que la guarda contra los topes es intrinseca.
+  FASE A  escalones: para cada nivel |u| aplica +u y luego -u (simetrico => vuelve solo al
+          punto de partida) y mide la velocidad por regresion sobre el 60% CENTRAL de cada
+          escalon -> CURVA ESTATICA. (Un barrido de tope a tope seria inviable: a 26 deg/s
+          de fondo, u=100 da 0.37 deg/s y cruzar 150 deg tardaria mas de 5 minutos.)
   FASE B  PRBS bang-bang centrado, con la amplitud CALCULADA de la FASE A para que la
           excursion quepa en el recorrido. -> DINAMICA / retardo.
 
@@ -55,6 +66,38 @@ TS = 0.1                 # impuesto por el Push Position 0x04/0x05 (9.90 Hz medi
 CENTER = 1024            # 0x04/0x01: 1024 = quieta
 MAX_CMD = 660            # rango 363..1685 => +-660 sobre el centro (mismo que el stick)
 PRBS_EXC = 7             # excursion acotada de una m-secuencia de 7 bits, en bits
+
+# --- PLANTA DEL GIMBAL, MEDIDA EN TIERRA (EXP-037). NO es la misma forma que el yaw. ---
+# ESTATICA: tiene zona muerta Y expo a la vez. Por eso fallaban los modelos simples
+# (potencia pura R2=0.967, lineal+zona muerta R2=0.963); los dos capturaban media verdad:
+#     rate = 0.000471454 * sign(u) * (|u| - 50)^1.704  deg/s   (0 si |u| < 50)
+#     R2 = 0.999998, err_max 0.02 deg/s sobre los 6 escalones. Fondo de escala 26.2 deg/s.
+# DINAMICA: rate[k] = 0.6065*rate[k-1] + 0.3935*r_sp[k-2] ; gpitch[k] = gpitch[k-1]+Ts*rate[k]
+#     tau = 0.200 s y ES OBSERVABLE (con tau: R2=0.919; con tau->0: R2=0.322). En el yaw
+#     esa diferencia era 0.00006 -> alli tau no existia a efectos practicos.
+# => el gimbal es una planta MAS DIFICIL que el yaw: polo extra en 0.6065 y ganancia local
+#    que varia x5.8 (u=100 -> 0.013 ; u=660 -> 0.073). El yaw solo variaba x1.9.
+# => la I sigue sobrando (hay integrador), pero la D aqui SI aporta (hay polo que amortiguar)
+#    y la INVERSION de zona muerta+expo pasa de opcional (yaw) a RECOMENDADA.
+DEADZONE_FIT = 50.0
+EXPO_A_FIT = 0.000471454
+EXPO_N_FIT = 1.704
+GIMBAL_TAU = 0.200
+GIMBAL_DELAY = 1        # muestras, UNA VEZ modelado tau (sin tau, un retardo puro finge 2)
+
+
+def rate_of(u):
+    """Velocidad de la camara para un comando u. Curva MEDIDA (R2=0.999998)."""
+    s = 1.0 if u >= 0 else -1.0
+    return s * EXPO_A_FIT * max(abs(u) - DEADZONE_FIT, 0.0) ** EXPO_N_FIT
+
+
+def cmd_for_rate(r):
+    """INVERSION: comando u que produce la velocidad 'r' deg/s. Linealiza la planta."""
+    if abs(r) < 1e-9:
+        return 0.0
+    s = 1.0 if r >= 0 else -1.0
+    return s * (DEADZONE_FIT + (abs(r) / EXPO_A_FIT) ** (1.0 / EXPO_N_FIT))
 
 
 def clamp(v, lo, hi):
@@ -380,15 +423,32 @@ def export_xlsx(csv_path, xlsx_path, ts=TS):
     ph = [r["phase"] for r in rows]
 
     wb = Workbook()
-    ws = wb.active; ws.title = "datos"
     grid = np.arange(t[0], t[-1], ts)
     g_g = np.interp(grid, t, g)
     idx = np.clip(np.searchsorted(t, grid, side="right") - 1, 0, len(u) - 1)
     u_g = u[idx]; ph_g = [ph[i] for i in idx]
+
+    # --- hoja 'datos': 3 columnas, entrada CRUDA (unidades de stick) ---
+    ws = wb.active; ws.title = "datos"
     ws.append(["tiempo_s", "entrada_u", "salida_gpitch_deg"])
     for i in range(len(grid)):
         ws.append([round(float(grid[i]), 3), int(u_g[i]), round(float(g_g[i]), 3)])
     for c, w_ in (("A", 12), ("B", 12), ("C", 18)):
+        ws.column_dimensions[c].width = w_
+
+    # --- hoja 'datos_lin': 3 columnas, entrada LINEALIZADA (deg/s) ---
+    # RECOMENDADA para ajustar. La estatica del gimbal es zona muerta 50 + expo 1.704
+    # (R2=0.999998), y su ganancia local varia x5.8 entre u=100 y u=660. Un ajuste lineal
+    # sobre la entrada CRUDA promedia esa no-linealidad y solo vale cerca de la amplitud
+    # a la que se ajusto (aqui, el PRBS fue a |u|=500). Con la entrada ya linealizada la
+    # planta es limpia y el PID vale en TODO el rango -- aplicando la inversion en el
+    # controlador. (En el yaw esto era opcional: alli la ganancia solo variaba x1.9.)
+    ws = wb.create_sheet("datos_lin")
+    r_lin = np.sign(u_g) * EXPO_A_FIT * np.maximum(np.abs(u_g) - DEADZONE_FIT, 0.0) ** EXPO_N_FIT
+    ws.append(["tiempo_s", "entrada_rate_deg_s", "salida_gpitch_deg"])
+    for i in range(len(grid)):
+        ws.append([round(float(grid[i]), 3), round(float(r_lin[i]), 4), round(float(g_g[i]), 3)])
+    for c, w_ in (("A", 12), ("B", 20), ("C", 18)):
         ws.column_dimensions[c].width = w_
 
     ws = wb.create_sheet("info")
@@ -449,7 +509,10 @@ def main():
                     help="movimiento por debajo del cual se considera 'quieto' (tope)")
     ap.add_argument("--still-secs", dest="still_secs", type=float, default=0.7,
                     help="segundos quieto para declarar tope")
-    ap.add_argument("--limit-timeout", dest="limit_timeout", type=float, default=12.0)
+    ap.add_argument("--limit-timeout", dest="limit_timeout", type=float, default=45.0,
+                    help="tope de tiempo para hallar CADA limite. 45s, no 12: a --probe-u 250 "
+                         "el gimbal va a ~4 deg/s y cruzar 90 deg tarda 22s. Con 12s el "
+                         "--probe se quedaba a medias y fingia un recorrido de 46 deg")
     ap.add_argument("--margin", type=float, default=6.0,
                     help="grados de respeto a los topes: NUNCA se empuja dentro de este margen")
     # FASE A
