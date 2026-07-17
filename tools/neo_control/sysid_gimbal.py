@@ -451,6 +451,37 @@ def export_xlsx(csv_path, xlsx_path, ts=TS):
     for c, w_ in (("A", 12), ("B", 20), ("C", 18)):
         ws.column_dimensions[c].width = w_
 
+    # --- hoja 'datos_prbs_rate': LA BUENA PARA AJUSTAR LA DINAMICA ---
+    # Tres arreglos sobre 'datos_lin', cada uno medido:
+    #  1) SALIDA = VELOCIDAD, no angulo. Sobre un integrador, simular 83 s en lazo abierto
+    #     integra cualquier error de ganancia -> deriva, y el fit% de MATLAB (que por
+    #     defecto es de SIMULACION) deja de medir la fisica: el modelo MEDIDO (tau=0.2,
+    #     R2=0.92 en la dinamica) saca fit=-119% sobre el angulo, PEOR que un orden-4 que
+    #     solo persigue la deriva con polos de sobra. Sobre la velocidad: 76%.
+    #     El integrador se añade DESPUES, analiticamente: G_total = G_rate * Ts*z^-1/(1-z^-1)
+    #  2) SOLO la FASE PRBS: excitacion rica y CONTIGUA (los STEP son tramos de entrada
+    #     constante que dominan los minimos cuadrados sin informar de la dinamica).
+    #  3) SIN los GOTO: son de LAZO CERRADO (un P reposicionando) y sesgan el ajuste.
+    #     Quitarlos vale 13 puntos de fit (62.7% -> 76.1%).
+    # ESTRUCTURA A PEDIR: 1er orden + retardo (la medida da polo 0.6065 = tau 0.2 s, 1
+    # muestra). NO orden 4: sobre-parametrizar con un integrador gasta polos en la deriva
+    # (el ajuste de orden 4 saco un par polo/cero que casi se cancela y un cero en 2.83,
+    # fuera del circulo unidad = fase no minima. Sintomas clasicos de sobre-ajuste).
+    ws = wb.create_sheet("datos_prbs_rate")
+    m = np.array([p == "PRBS" for p in ph_g])
+    if m.sum() > 20:
+        i0, i1 = int(np.argmax(m)), len(m) - int(np.argmax(m[::-1]))
+        gp_seg = g_g[i0:i1]
+        rate_out = np.gradient(gp_seg, ts)                       # velocidad medida
+        rate_in = r_lin[i0:i1]                                   # velocidad comandada
+        tt = grid[i0:i1] - grid[i0]
+        ws.append(["tiempo_s", "entrada_rate_deg_s", "salida_rate_deg_s"])
+        for i in range(len(tt)):
+            ws.append([round(float(tt[i]), 3), round(float(rate_in[i]), 4),
+                       round(float(rate_out[i]), 4)])
+        for c, w_ in (("A", 12), ("B", 20), ("C", 20)):
+            ws.column_dimensions[c].width = w_
+
     ws = wb.create_sheet("info")
     sw = [r for r in rows if r["phase"].startswith("SWEEP")]
     info = [
