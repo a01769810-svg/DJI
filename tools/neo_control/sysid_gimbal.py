@@ -136,7 +136,7 @@ def find_limit(gb, u, args, samples, label):
     return gb.gp
 
 
-def goto(gb, target, args, samples, tol=1.5, timeout=10.0):
+def goto(gb, target, args, samples, tol=1.5, timeout=None):
     """Lleva la camara a 'target' con un P sencillo (el esquema de point_camera).
     Solo para posicionar entre fases; no se identifica con esto.
 
@@ -144,6 +144,12 @@ def goto(gb, target, args, samples, tol=1.5, timeout=10.0):
     llamarlo dos veces (una para leer, otra para mandar) es una CARRERA: gana la primera
     y si esa mandaba 0 la camara no se mueve. Ese bug dejaba el PRBS sin centrar y lo
     estampaba contra el tope."""
+    # el timeout se ESCALA a la distancia: un gimbal lento (~4.5 deg/s a fondo segun el
+    # log de mapflight) tarda 33s en cruzar 150 deg. Un timeout fijo de 10s lo dejaba a
+    # medias y descentraba el PRBS.
+    if timeout is None:
+        d0 = abs(target - gb.gp) if gb.gp is not None else 90.0
+        timeout = clamp(d0 / 1.5 + 5.0, 8.0, 90.0)
     t0 = time.time()
     while time.time() - t0 < timeout:
         g = gb.gp                                  # ultima lectura conocida (no consume ranura)
@@ -164,27 +170,31 @@ def goto(gb, target, args, samples, tol=1.5, timeout=10.0):
 
 
 # ------------------------------------------------------------------ FASE A: barridos
-def sweep(gb, u, lo, hi, args, samples):
-    """Barre a velocidad constante 'u' de un extremo al otro, parando ANTES del tope.
-    Devuelve la velocidad estacionaria medida en el tramo CENTRAL (ignora arranque y
-    frenado). Es la curva estatica: rate vs comando."""
-    m = args.margin
-    tgt_lo, tgt_hi = lo + m, hi - m
+def step(gb, u, lo, hi, args, samples):
+    """Aplica 'u' durante --step-secs y mide la velocidad estacionaria por regresion sobre
+    el 60% CENTRAL (fuera transitorios de arranque y parada). Es la curva estatica.
+
+    Escalon de DURACION FIJA cerca del centro, NO barrido de tope a tope: un barrido
+    completo es inviable si el eje es lento (a 4.5 deg/s cruzar 150 deg son 33 s, y a
+    u=100 mas de 5 min). Con escalones simetricos (+u y luego -u) se vuelve solo al punto
+    de partida y sirve igual si el gimbal resulta rapido.
+    Guarda: si nos acercamos a un tope, corta y devuelve lo medido hasta ahi."""
     pts = []
-    t0 = time.time()
-    while time.time() - t0 < args.sweep_timeout:
-        g, t = gb.pump(u)
-        if g is None:
-            continue
-        pts.append((t, g))
-        samples.append(dict(t_s=round(t - args.t0, 4), u_cmd=int(u),
-                            phase="SWEEP%+d" % u, gpitch=g))
-        if (u > 0 and g >= tgt_hi) or (u < 0 and g <= tgt_lo):
+    t_end = time.time() + args.step_secs
+    while time.time() < t_end:
+        g = gb.gp
+        if g is not None and ((u > 0 and g > hi - args.margin) or (u < 0 and g < lo + args.margin)):
+            print("   (guarda: cerca del tope en %.1f, corto el escalon u=%+d)" % (g, u), flush=True)
             break
-    gb.hold(0.2, 0)
-    if len(pts) < 6:
+        gnew, t = gb.pump(u)                      # UN solo pump por vuelta
+        if gnew is None:
+            continue
+        pts.append((t, gnew))
+        samples.append(dict(t_s=round(t - args.t0, 4), u_cmd=int(u),
+                            phase="STEP%+d" % u, gpitch=gnew))
+    gb.hold(0.3, 0)
+    if len(pts) < 8:
         return None
-    # velocidad por regresion sobre el 60% CENTRAL (fuera transitorios de arranque/parada)
     a, b = int(len(pts) * 0.2), int(len(pts) * 0.8)
     seg = pts[a:b]
     if len(seg) < 4:
@@ -228,9 +238,19 @@ def run(args):
         print("angulo inicial: %.1f deg" % g0, flush=True)
 
         # ---------------- FASE 0: topes ----------------
-        print("\n1) FASE 0 — topes mecanicos (empuje suave, para al no responder)...", flush=True)
-        lo = find_limit(gb, -args.probe_u, args, samples, "ABAJO")
-        hi = find_limit(gb, +args.probe_u, args, samples, "ARRIBA")
+        if args.lo is not None and args.hi is not None:
+            # topes DECLARADOS por el usuario (los suyos: -90/+60, comprobados con la app).
+            # OJO: lo que permite la APP no tiene por que ser lo que alcanza NUESTRO camino
+            # (DJI suele gatear el tilt hacia arriba tras un ajuste). Por eso --probe sigue
+            # siendo lo recomendado la primera vez: confirma que tenemos la misma autoridad.
+            lo, hi = args.lo, args.hi
+            print("\n1) FASE 0 SALTADA: topes declarados %.1f .. %.1f  (--lo/--hi)" % (lo, hi))
+            print("   OJO: sin verificar que nuestro path los alcance. Si el gimbal no llega,")
+            print("   la excursion calculada no cabe y la guarda tendra que actuar.", flush=True)
+        else:
+            print("\n1) FASE 0 — topes mecanicos (empuje suave, para al no responder)...", flush=True)
+            lo = find_limit(gb, -args.probe_u, args, samples, "ABAJO")
+            hi = find_limit(gb, +args.probe_u, args, samples, "ARRIBA")
         travel = hi - lo
         center = (hi + lo) / 2.0
         print(">>> RECORRIDO: %.1f .. %.1f  = %.1f deg de rango  (centro %.1f)"
@@ -242,19 +262,24 @@ def run(args):
             print("\n--probe: solo los topes. Fin.")
             return
 
-        # ---------------- FASE A: barridos ----------------
-        print("\n2) FASE A — barridos (curva estatica: velocidad vs comando)...", flush=True)
+        # ---------------- FASE A: escalones ----------------
+        print("\n2) FASE A — escalones (curva estatica: velocidad vs comando)...", flush=True)
         levels = [int(x) for x in args.levels.split(",") if x.strip()]
         curve = {}
+        goto(gb, center, args, samples)
         for L in levels:
-            goto(gb, lo + args.margin + 2, args, samples)
-            r_up = sweep(gb, +L, lo, hi, args, samples)
-            goto(gb, hi - args.margin - 2, args, samples)
-            r_dn = sweep(gb, -L, lo, hi, args, samples)
+            # +L y luego -L: SIMETRICO => vuelve solo al punto de partida, sin reposicionar.
+            # (Antes esto barria de tope a tope y era inviable con un eje lento: a 4.5 deg/s
+            #  cruzar 150 deg son 33 s, y a u=100 mas de 5 minutos.)
+            r_up = step(gb, +L, lo, hi, args, samples)
+            r_dn = step(gb, -L, lo, hi, args, samples)
             curve[L] = (r_up, r_dn)
-            print("   u=%+4d -> subiendo %s  |  u=%+4d -> bajando %s"
-                  % (L, ("%.1f deg/s" % r_up) if r_up else "?",
-                     -L, ("%.1f deg/s" % r_dn) if r_dn else "?"), flush=True)
+            print("   u=%+4d -> %s  |  u=%+4d -> %s   (gpitch=%.1f)"
+                  % (L, ("subiendo %.2f deg/s" % r_up) if r_up else "sin medida",
+                     -L, ("bajando %.2f deg/s" % r_dn) if r_dn else "sin medida",
+                     gb.gp if gb.gp is not None else 0), flush=True)
+            if gb.gp is not None and abs(gb.gp - center) > 20:
+                goto(gb, center, args, samples)      # recentra si derivo
 
         # ---------------- FASE B: PRBS dimensionado con los datos de arriba ----------------
         usable = [(L, (abs(u) + abs(d)) / 2) for L, (u, d) in curve.items() if u and d]
@@ -409,6 +434,12 @@ def export_xlsx(csv_path, xlsx_path, ts=TS):
 def main():
     ap = argparse.ArgumentParser(description="Identificacion del gimbal del Neo (EN TIERRA)")
     ap.add_argument("--probe", action="store_true", help="SOLO la FASE 0 (topes). Correr esto primero")
+    ap.add_argument("--lo", type=float, default=None,
+                    help="tope INFERIOR conocido (deg), salta la FASE 0. El usuario midio -90 con "
+                         "la app. Requiere --hi. OJO: lo que permite la app puede NO ser lo que "
+                         "alcanza nuestro path -> --probe lo confirma")
+    ap.add_argument("--hi", type=float, default=None,
+                    help="tope SUPERIOR conocido (deg), salta la FASE 0. El usuario midio +60")
     ap.add_argument("--export", metavar="CSV", default=None, help="CSV -> .xlsx (usa el .venv)")
     ap.add_argument("--out", default="sysid_gimbal.csv")
     # FASE 0
@@ -424,7 +455,9 @@ def main():
     # FASE A
     ap.add_argument("--levels", default="100,200,300,400,500,660",
                     help="niveles |u| de los barridos (se hacen + y -)")
-    ap.add_argument("--sweep-timeout", dest="sweep_timeout", type=float, default=12.0)
+    ap.add_argument("--step-secs", dest="step_secs", type=float, default=8.0,
+                    help="duracion de cada escalon. Debe bastar para que la velocidad se "
+                         "establezca Y para medirla con 0.1 deg de resolucion si el eje es lento")
     # FASE B
     ap.add_argument("--prbs-bits", dest="prbs_bits", type=int, default=127, help="0 = sin PRBS")
     ap.add_argument("--prbs-bit-secs", dest="prbs_bit_secs", type=float, default=0.3,
