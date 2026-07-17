@@ -60,6 +60,21 @@ KP, KI, KD = 121.251465320811, 95.1967343212135, 7.33540859003448
 
 # --- planta identificada en EXP-034 (para --sim) ---
 EXPO_A, EXPO_N = 49.5, 1.351      # rate = A*(|u|/660)^N deg/s
+MAX_RATE = EXPO_A                 # tope fisico de giro: nada mas rapido es real
+
+# RETARDO REAL = 1.5 muestras (155 ms), MEDIDO EN LAZO CERRADO (EXP-035), no 1 como
+# dijo EXP-034. El lazo abierto con bits de 300ms tiene resolucion de 1 muestra y no
+# distingue 1.0 de 1.5. El CICLO LIMITE si: en un relay+retardo+integrador el periodo es
+# T = 4*retardo; medido T=0.62s muy regular => retardo = 0.155 s. Los ~55 ms extra sobre
+# el z^-1 del ZOH son el stream de sticks a 20Hz (25 ms de ZOH medio) + el viaje WiFi.
+DELAY_S = 0.155
+
+# Umbral de RECHAZO DE MEDIDAS ABSURDAS. En EXP-035 el OSD reporto un salto de -43 deg
+# en 0.4 s (-156 y -116 deg/s) con el stick en +8: fisicamente imposible (el tope son
+# 49.5 deg/s). El PID reacciono clavando +660 y giro el dron de verdad. Una sola vez en
+# 78 s, pero basta para ser un peligro. Se descartan las muestras que impliquen una
+# velocidad por encima del tope fisico + margen: no pueden ser el dron moviendose.
+RATE_REJECT = 60.0                # deg/s
 
 
 def plant_rate(u):
@@ -70,6 +85,38 @@ def plant_rate(u):
 
 def wrap180(a):
     return ((a + 180.0) % 360.0) - 180.0
+
+
+class YawGate:
+    """Rechaza lecturas de yaw fisicamente imposibles antes de que lleguen al PID.
+    Si una muestra implica |velocidad| > RATE_REJECT (el dron satura en 49.5 deg/s), NO
+    es el dron moviendose: es un salto de la estimacion de rumbo del FC. Se descarta y se
+    mantiene la anterior. Para no quedarse pegado si el rumbo cambio de verdad, tras
+    'max_rej' rechazos seguidos se acepta y se re-sincroniza."""
+
+    def __init__(self, max_rej=5):
+        self.y = None
+        self.t = None
+        self.max_rej = max_rej
+        self.n_rej = 0
+        self.total = 0
+
+    def feed(self, yaw, t):
+        """Devuelve (yaw_valido, rechazada). yaw_valido es None hasta la 1a muestra."""
+        if self.y is None:
+            self.y, self.t = yaw, t
+            return yaw, False
+        dt = t - self.t
+        if dt <= 0:
+            return self.y, False
+        rate = abs(wrap180(yaw - self.y)) / dt
+        if rate > RATE_REJECT and self.n_rej < self.max_rej:
+            self.n_rej += 1
+            self.total += 1
+            return self.y, True                    # descarta: mantiene la ultima buena
+        self.n_rej = 0
+        self.y, self.t = yaw, t
+        return yaw, False
 
 
 class YawPID:
@@ -133,10 +180,12 @@ def simulate(args):
     sp_abs = 0.0
     rows = []
     t = 0.0
-    # cola de retardo de UNA muestra: yaw[k] = yaw[k-1] + Ts*rate(u[k-1]), que es el
-    # modelo medido en EXP-034 (G(z)=Ts*z^-1/(1-z^-1)). Con DOS elementos se estaria
-    # simulando u[k-2] = el doble del retardo real.
-    ud = [0.0]
+    # Retardo FRACCIONARIO de DELAY_S/Ts = 1.55 muestras (medido en lazo cerrado por el
+    # periodo del ciclo limite, EXP-035). Se interpola entre u[k-1] y u[k-2].
+    # NO usar 1 muestra exacta: con 1 la simulacion NO reproduce el ciclo limite que el
+    # dron SI hace, y da un falso "0.01 deg de error".
+    ud = [0.0, 0.0, 0.0]
+    frac = DELAY_S / TS - 1.0                      # parte fraccionaria sobre u[k-1]
     print("SIM: planta EXP-034 (expo %.1f/(x)^%.3f, sat +-%d, %d ms de retardo)"
           % (EXPO_A, EXPO_N, MAX_DEFL, TS * 1000))
     print("     PID Kp=%.2f Ki=%.2f Kd=%.3f  Ts=%.0fms" % (KP, KI, KD, TS * 1000))
@@ -149,7 +198,8 @@ def simulate(args):
         reached = None
         while t < t_end:
             u, e, P, I, D = pid.step(sp_abs, yaw)
-            ud.append(u); u_eff = ud.pop(0)            # 1 muestra de retardo
+            ud.append(u); ud.pop(0)
+            u_eff = (1 - frac) * ud[-2] + frac * ud[-3]   # retardo fraccionario 1.55
             yaw = wrap180(yaw + TS * plant_rate(u_eff))
             t += TS
             rows.append((round(t, 2), round(sp_abs, 2), round(yaw, 2), round(u, 1),
@@ -191,18 +241,39 @@ def pid_loop(f, args, log):
         if time.time() - t0 > 5:
             return "sin OSD"
     sp = o["yaw"]
+    gate = YawGate()
     for rel, hold in tg:
         sp = wrap180(sp + rel)
+        sp_cmd = sp if not args.ramp else None      # con --ramp el setpoint se rampea
         pid.y_prev = None
         t_seg = time.time()
-        print(">>> objetivo: yaw = %+.1f deg  (%+.0f relativo, %.1fs)" % (sp, rel, hold), flush=True)
+        t_last = t_seg
+        print(">>> objetivo: yaw = %+.1f deg  (%+.0f relativo, %.1fs)%s"
+              % (sp, rel, hold, "  [rampa %.0f deg/s]" % args.ramp if args.ramp else ""),
+              flush=True)
         while time.time() - t_seg < hold:
             o = _pump(f, nt, u_hold)
             if o is not None:                       # <- muestra nueva: recalcula el PID
-                u, e, P, I, D = pid.step(sp, o["yaw"])
+                now = time.time()
+                # 1) descarta lecturas de yaw imposibles antes de que lleguen al PID
+                yaw_ok, rejected = gate.feed(o["yaw"], now)
+                if rejected:
+                    print("  !! yaw ABSURDO descartado: %+.1f (implicaba > %.0f deg/s). "
+                          "Se mantiene %+.1f" % (o["yaw"], RATE_REJECT, yaw_ok), flush=True)
+                # 2) rampa del setpoint: mantiene el lazo FUERA de saturacion -> lineal
+                if args.ramp:
+                    if sp_cmd is None:
+                        sp_cmd = yaw_ok
+                    step_max = args.ramp * (now - t_last)
+                    d = wrap180(sp - sp_cmd)
+                    sp_cmd = wrap180(sp_cmd + max(-step_max, min(step_max, d)))
+                t_last = now
+                target = sp_cmd if args.ramp else sp
+                u, e, P, I, D = pid.step(target, yaw_ok)
                 u_hold = u
-                log.append(dict(t_s=round(time.time() - t0, 3), setpoint=round(sp, 2),
-                                yaw=o["yaw"], u=round(u, 1), err=round(e, 2),
+                log.append(dict(t_s=round(now - t0, 3), setpoint=round(target, 2),
+                                sp_final=round(sp, 2), yaw=o["yaw"], yaw_ok=round(yaw_ok, 2),
+                                rejected=int(rejected), u=round(u, 1), err=round(e, 2),
                                 P=round(P, 1), I=round(I, 1), D=round(D, 1),
                                 sat=int(pid.sat), height_m=o["height_m"],
                                 motor_on=int(o["motor_on"])))
@@ -339,6 +410,11 @@ def main():
     ap.add_argument("--armed-ok", dest="armed_ok", action="store_true")
     ap.add_argument("--sim", action="store_true", help="simula contra la planta de EXP-034 (sin dron)")
     ap.add_argument("--sim-csv", dest="sim_csv", default=None)
+    ap.add_argument("--ramp", type=float, default=0.0, metavar="DEG_S",
+                    help="rampa el setpoint a DEG_S deg/s en vez de saltar. 0 = escalon "
+                         "(lo validado en EXP-035). La rampa mantiene el lazo FUERA de "
+                         "saturacion -> lineal -> mata el ciclo limite y ahi SI valen las "
+                         "metricas del diseño. Recomendado ~35 (el dron topa en 49.5)")
     ap.add_argument("--angle", type=float, default=90.0, help="amplitud del escalon de yaw (deg)")
     ap.add_argument("--hold", type=float, default=6.0, help="segundos por objetivo")
     ap.add_argument("--settle-air", dest="settle_air", type=float, default=3.0)
