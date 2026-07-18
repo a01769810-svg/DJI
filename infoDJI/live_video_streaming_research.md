@@ -1,5 +1,18 @@
 # Brief de investigación: preview de vídeo EN VIVO de un stream HEVC "sucio" (DJI Neo)
 
+> **RESUELTO (2026-07-18).** La clave era el flag de decoder **`showall`** (FFmpeg 8.1.2 /
+> PyAV 18 lo soporta en HEVC desde feb-2025): hace que PyAV **emita los frames corruptos** en
+> vez de descartarlos. Solución: `CodecContext.create('hevc','r')` con
+> `options={'flags2':'+showall','err_detect':'ignore_err'}`, alimentado **incremental** con los
+> bytes reensamblados (cursor) → el decoder mantiene estado, cada frame se decodifica **una vez**
+> (~14× tiempo real, sin relag). Medido en el clip real: sin flags 299 frames, con `showall`
+> **1852**. Implementado en `mapflight.py` `_decode_thread` (imshow en el hilo principal).
+> `cv2.VideoCapture` queda solo como decoder offline de validación. El resto del brief se
+> conserva como registro de lo que se probó.
+
+---
+
+
 Documento para pasar a un asistente de investigación (ChatGPT). Es autocontenido: no
 necesita conocer el resto del proyecto. Objetivo: encontrar una forma de mostrar el vídeo
 casi en vivo (para supervisar) que no sea ni "fea" (artefactos) ni "lenta".
