@@ -58,29 +58,46 @@ TS_YAW     = YP.TS     # 0.1 s: cadencia del PID (= la del OSD); ZOH entre recal
 # rampa=25, 90deg tardan ~3.6s y 180deg ~7.2s (giro SUAVE), no el bang-bang a ~49deg/s.
 def _turn_timeout(deg, ramp):
     slew = abs(deg) / (ramp if ramp else YP.MAX_RATE)
-    return slew + 8.0
+    return slew + 4.0     # backstop ajustado para pasos chicos (45deg): no comer 10s si el yaw ruidoso no cierra
 
-def build_sequence(defl, fwd_secs, side_secs):
-    """Secuencia de MAPEO **TRASLACION-DOMINANTE** (EXP-diag: rotar NO da paralaje; el SLAM
-    monocular necesita TRASLACION para inicializar/escalar). Sin giros: solo desplazamientos,
-    SIMETRICOS -> el dron REGRESA al inicio al final para aterrizar ahi.
-      - adelante fwd_secs y REGRESA (atras fwd_secs)
-      - izquierda side_secs y regresa; derecha side_secs y regresa
-    Las pausas NEUTRAL entre tramos: ahi el gimbal BARRE (cobertura vertical); durante los
-    tramos de traslacion el gimbal se MANTIENE fijo (paralaje limpio, sin rotacion aparente).
-    Regla de gimbal automatica en run(): sticks==NEUTRAL -> barre; si no -> mantiene."""
+def _turn_steps(total_deg, step, pause):
+    """Divide un giro de 'total_deg' en PASOS de 'step' grados con una PAUSA entre cada uno
+    (para captar panorama: en la pausa el gimbal barre la vertical). total_deg>0=DERECHA,
+    <0=IZQUIERDA. Cada paso es un ('turn', +-step) de lazo cerrado + un ('move', NEUTRAL, pause)."""
+    n = max(1, int(round(abs(total_deg) / step)))
+    s = step if total_deg > 0 else -step
+    out = []
+    for _ in range(n):
+        out.append(("turn", s))
+        out.append(("move", NEUTRAL, pause))
+    return out
+
+
+def build_sequence(defl, fwd_secs, side_secs, turn_step=45.0, turn_pause=2.0):
+    """Secuencia de MAPEO (coreografia del usuario): TRASLACION para PARALAJE (SLAM) + GIROS
+    escalonados para cobertura 360. SIMETRICA -> REGRESA al inicio (posicion Y rumbo) para
+    aterrizar ahi. Neto: adelante15+atras15=0, izq8+der16+izq8=0, -180+360-180=0.
+      adelante fwd_secs -> espera 3s -> izquierda 180 (pasos de turn_step) -> derecha 360 (pasos)
+      -> izquierda 180 (pasos) -> izquierda side_secs -> derecha 2*side_secs -> izquierda side_secs
+      -> atras fwd_secs -> aterriza.
+    Gimbal (regla en run()): MANTIENE --cam-pitch al trasladar y al girar (paralaje limpio / no
+    marear); BARRE en las PAUSAS NEUTRAL (cobertura vertical por cada rumbo del panorama).
+    OJO: los giros son lazo cerrado sobre el rumbo del OSD, ruidoso INDOOR -> pasos aproximados."""
     d = max(0, min(int(defl), 500))                   # tope de seguridad (rango stick +-660)
     FWD, BACK   = _mv(dp=d),   _mv(dp=-d)
     LEFT, RIGHT = _mv(dr=-d),  _mv(dr=d)
-    return [
-        ("move", NEUTRAL, 3.0),                        # estabiliza + barrido de gimbal
-        ("move", FWD,  fwd_secs),  ("move", BACK, fwd_secs),   # ADELANTE y regresa
-        ("move", NEUTRAL, 2.0),                        # pausa: barrido
-        ("move", LEFT,  side_secs), ("move", RIGHT, side_secs),  # IZQUIERDA y regresa al centro
-        ("move", NEUTRAL, 2.0),
-        ("move", RIGHT, side_secs), ("move", LEFT,  side_secs),  # DERECHA y regresa al centro
-        ("move", NEUTRAL, 2.0),                        # ~en el inicio -> aterriza
-    ]
+    seq = [("move", NEUTRAL, 3.0),                     # estabiliza a la altura de mapeo
+           ("move", FWD, fwd_secs),                    # ADELANTE
+           ("move", NEUTRAL, 3.0)]                     # espera 3s
+    seq += _turn_steps(-180, turn_step, turn_pause)    # IZQUIERDA 180 por pasos
+    seq += _turn_steps(+360, turn_step, turn_pause)    # DERECHA 360 por pasos
+    seq += _turn_steps(-180, turn_step, turn_pause)    # IZQUIERDA 180 por pasos (vuelve al rumbo)
+    seq += [("move", LEFT,  side_secs),                # IZQUIERDA
+            ("move", RIGHT, 2.0 * side_secs),          # DERECHA (cruza al otro costado)
+            ("move", LEFT,  side_secs),                # IZQUIERDA (vuelve al centro)
+            ("move", BACK,  fwd_secs),                 # ATRAS (vuelve al inicio)
+            ("move", NEUTRAL, 2.0)]                    # ~en el inicio -> aterriza
+    return seq
 
 # Ascenso: el auto-despegue del Neo se queda ~0.7m y su altitude-hold RESISTE empujes
 # timidos (+220 no subio nada). Para subir a --alt hay que empujar el throttle FUERTE
@@ -359,8 +376,13 @@ def _events_no_sticks(pcap, tmax):
 
 def run(args):
     real = args.fly and args.armed_ok
-    seq = MapSequencer(build_sequence(args.defl, args.fwd_secs, args.side_secs), int(args.yaw_defl),
-                       args.yaw_kp, args.yaw_ki, args.yaw_kd, args.yaw_ramp)    # traslacion-dominante
+    # AUTO: la pausa de cada paso del giro = un barrido de gimbal COMPLETO (ida y vuelta) + margen,
+    # para que capture toda la vertical en cada rumbo del panorama. (--turn-pause N lo fija a mano.)
+    if args.turn_pause <= 0:
+        args.turn_pause = 2.0 * abs(args.gimbal_hi - args.gimbal_lo) / max(args.gimbal_rate, 1e-6) + 2.0
+    seq = MapSequencer(build_sequence(args.defl, args.fwd_secs, args.side_secs,
+                                      args.turn_step, args.turn_pause), int(args.yaw_defl),
+                       args.yaw_kp, args.yaw_ki, args.yaw_kd, args.yaw_ramp)
     scanner = GimbalScanner(args.gimbal_lo, args.gimbal_hi, args.gimbal_rate)   # barrido de camara
     d_thr = max(0, min(int(args.climb_thr), 640))      # tope: 1024+640=1664 (< max 1684)
     climb_stick = (1024, 1024, 1024 + d_thr, 1024)     # throttle arriba FUERTE para subir
@@ -368,10 +390,10 @@ def run(args):
     print("  mapflight.py  —  %s" % ("VUELO + GRABACION" if real else "DRY (graba en tierra, sin despegar)"))
     print("  defl=%d  ascenso a %.1fm (+%d x%.0fs, tope seg. %.1fm)"
           % (args.defl, args.alt, args.climb_thr, args.climb_secs, args.alt_max))
-    print("  patron: TRASLACION-dominante -> adelante %.0fs + costados %.0fs (SIN giros, regresa al inicio)"
-          % (args.fwd_secs, args.side_secs))
-    print("  camara: MANTIENE %.0f deg al trasladar (paralaje limpio) / BARRE %.0f..%.0f @ %.0f deg/s en pausas"
-          % (args.cam_pitch, args.gimbal_lo, args.gimbal_hi, args.gimbal_rate))
+    print("  patron: adelante %.0fs + PANORAMA (izq180/der360/izq180 en pasos de %.0f) + costados %.0f/%.0f/%.0fs -> regresa al inicio"
+          % (args.fwd_secs, args.turn_step, args.side_secs, 2 * args.side_secs, args.side_secs))
+    print("  camara: MANTIENE %.0f deg al mover/girar (paralaje) / BARRE %.0f..%.0f @ %.0f deg/s en PAUSAS de %.1fs (escaneo completo)"
+          % (args.cam_pitch, args.gimbal_lo, args.gimbal_hi, args.gimbal_rate, args.turn_pause))
     print("=" * 64)
     if args.fly and not args.armed_ok:
         print("!! --fly requiere --armed-ok. Abortado."); return
@@ -630,10 +652,10 @@ def main():
     ap.add_argument("--pcap", default=PCAP_DEFAULT, help="captura para el arranque de video")
     ap.add_argument("--tmax", type=float, default=50.0, help="replay del init hasta t+N (mantiene keyframes)")
     ap.add_argument("--tvideo", type=float, default=18.0, help="segundos en tierra antes de despegar (replay ~12s + settle limpio ~6s)")
-    ap.add_argument("--cap", type=float, default=90.0,
-                    help="TOPE de seguridad del patron (s). El patron traslacion-dominante dura "
-                         "~3+2*fwd+4*side+6 s (con defaults ~70s); el cap es el respaldo. OJO BATERIA: "
-                         "el total en aire (ascenso+patron+aterrizaje) puede rondar ~100s (2S del Neo)")
+    ap.add_argument("--cap", type=float, default=420.0,
+                    help="TOPE de seguridad del patron (s). Con el PANORAMA (720deg en pasos + escaneo "
+                         "completo por parada) el patron dura ~5-6 MIN; el cap solo corta si algo se "
+                         "atasca. ACORTA con --turn-step 90 (mitad de paradas) o --turn-pause chico")
     ap.add_argument("--defl", type=float, default=300.0,
                     help="deflexion del stick en la TRASLACION. En el ultimo vuelo 250 casi no "
                          "movio (vH~0); 300 (default) mueve mas -> mas PARALAJE. 350=amplio. Tope "
@@ -642,7 +664,13 @@ def main():
                     help="segundos ADELANTE (luego regresa igual atras). Default 15. El dron NO "
                          "evita obstaculos: en cuarto chico vigila que no choque; Ctrl+C aterriza")
     ap.add_argument("--side-secs", dest="side_secs", type=float, default=8.0,
-                    help="segundos a cada COSTADO (izq y der, cada uno regresa al centro). Default 8")
+                    help="segundos base de COSTADO: izquierda N, derecha 2N (cruza), izquierda N. Default 8")
+    ap.add_argument("--turn-step", dest="turn_step", type=float, default=45.0,
+                    help="tamano del paso de giro del panorama (deg). Default 45. Sube (p.ej. 90) "
+                         "para MENOS paradas -> vuelo mas corto; baja para panorama mas fino")
+    ap.add_argument("--turn-pause", dest="turn_pause", type=float, default=0.0,
+                    help="segundos de pausa en cada paso del giro (para el escaneo del gimbal). "
+                         "0=AUTO: un barrido de gimbal COMPLETO (ida+vuelta). Fijalo a mano para acortar")
     ap.add_argument("--yaw-defl", dest="yaw_defl", type=float, default=600.0,
                     help="SATURACION del stick de yaw en los giros (umax del PID; el rango real "
                          "es +-660). Con --yaw-ramp el lazo casi no satura. Default 600, tope 660")
