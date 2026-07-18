@@ -17,7 +17,7 @@ MODOS:
                       Valida la maquina combinada de forma SEGURA.
   --fly --armed-ok    VUELO REAL de mapeo: estabiliza video -> despega -> SUBE a --alt
                       (throttle, lazo cerrado con la altura) -> patron: traslacion (paralaje)
-                      + barrido de yaw en una direccion (cobertura) -> aterriza. La camara se
+                      + giros de yaw en LAZO CERRADO con PID (cobertura) -> aterriza. La camara se
                       apunta a --cam-pitch (abajo) en lazo cerrado. Los flags son la confirmacion.
 
 SEGURIDAD: patron simetrico (vuelve ~al inicio), deflexion baja, tope de tiempo (--cap),
@@ -33,6 +33,7 @@ import argparse, socket, sys, threading, time
 import neo_udp as N
 import flight as F
 import video as V
+import yaw_pid as YP        # reusa el PID de yaw validado en EXP-035/036 (YawPID/YawGate/rampa)
 
 PCAP_DEFAULT = "C:\\Users\\santi\\Desktop\\DJI project\\Novena captura.pcap"
 
@@ -45,13 +46,17 @@ NEUTRAL = F.NEUTRAL
 
 # Pasos de la secuencia de mapeo. Dos tipos:
 #   ("move", sticks, secs) -> mantiene 'sticks' 'secs' segundos (traslacion/pausa, LAZO ABIERTO)
-#   ("turn", grados)       -> giro de LAZO CERRADO: gira hasta cambiar 'grados' el yaw real del
-#                             OSD (grados>0 = DERECHA, ch3+, yaw sube; grados<0 = IZQUIERDA).
-YAW_TOL = 8.0          # grados de tolerancia para dar por cerrado un giro
-# El Neo gira LENTO (~6 deg/s medido a defl 250). El timeout por giro se escala al angulo
-# (respaldo si no cierra): 90deg -> ~19s, 180deg -> ~32s a ~7deg/s + margen.
-def _turn_timeout(deg):
-    return abs(deg) / 7.0 + 6.0
+#   ("turn", grados)       -> giro de LAZO CERRADO con el PID de yaw (EXP-035/036, reusa
+#                             yaw_pid.YawPID): gira 'grados' relativos al rumbo del OSD al
+#                             empezar el paso (grados>0 = DERECHA, ch3+, yaw sube; <0 = IZQUIERDA).
+YAW_TOL    = 3.0       # grados: el PID sostiene mucho mejor que el bang-bang viejo (era 8)
+YAW_SETTLE = 0.5       # s dentro de tolerancia (Y con la rampa ya terminada) para cerrar el giro
+TS_YAW     = YP.TS     # 0.1 s: cadencia del PID (= la del OSD); ZOH entre recalculos
+# Backstop por si la telemetria falla: tiempo de rampa (|deg|/ramp) + margen holgado. Con
+# rampa=25, 90deg tardan ~3.6s y 180deg ~7.2s (giro SUAVE), no el bang-bang a ~49deg/s.
+def _turn_timeout(deg, ramp):
+    slew = abs(deg) / (ramp if ramp else YP.MAX_RATE)
+    return slew + 8.0
 
 def build_sequence(defl):
     """Secuencia de MAPEO:
@@ -79,21 +84,37 @@ def build_sequence(defl):
 # con la altura del OSD lo PARA en --alt. Se construye en run() desde --climb-thr.
 
 class MapSequencer:
-    """Ejecuta la secuencia de mapeo paso a paso. Los 'move' son por tiempo (lazo abierto);
-    los 'turn' son LAZO CERRADO sobre el yaw del OSD: acumula la rotacion real (des-envolviendo
-    el wrap +-180) y gira hasta alcanzar los grados pedidos, frenando cerca del objetivo. Un
-    timeout por giro evita quedarse girando si la telemetria falla. done=True al terminar."""
-    def __init__(self, sequence, yaw_defl):
+    """Ejecuta la secuencia de mapeo paso a paso.
+      - 'move': por tiempo (LAZO ABIERTO), sin cambios.
+      - 'turn': LAZO CERRADO con el PID de yaw de EXP-035/036 (yaw_pid.YawPID + YawGate + rampa
+        del setpoint). Al empezar el paso fija el objetivo ABSOLUTO = wrap180(yaw_actual + grados)
+        y el PID escribe el stick de yaw directamente (mismas ganancias y unidades que yaw_pid;
+        no se invierte el expo, va dentro del modelo). La rampa (--yaw-ramp) mantiene el lazo
+        FUERA de saturacion -> giro suave a velocidad ~constante (ideal para cobertura/SLAM) y
+        sin ciclo limite. El giro se da por cerrado cuando la rampa YA llego al objetivo Y
+        |error| <= YAW_TOL sostenido YAW_SETTLE s; el timeout es respaldo si falla la telemetria.
+    done=True al terminar toda la secuencia."""
+    def __init__(self, sequence, yaw_defl, kp, ki, kd, ramp):
         self.seq = sequence
-        self.yd_max = max(0, min(int(yaw_defl), 640))   # tope: 1024+640=1664 (< max 1684)
+        self.umax = max(0, min(int(yaw_defl), 660))    # saturacion del stick de yaw (rango +-660)
+        self.gains = (kp, ki, kd)
+        self.ramp = ramp
         self.i = 0
         self.step_start = None
-        self.yaw_prev = None
-        self.accum = 0.0
         self.done = False
+        self._turn_reset()
+
+    def _turn_reset(self):
+        self.pid = None            # se crea con la 1a lectura de yaw valida del paso
+        self.gate = None
+        self.sp = None             # objetivo absoluto del giro
+        self.sp_cmd = None         # setpoint rampeado
+        self.u_hold = 0.0          # ultimo stick calculado (ZOH entre recalculos del PID)
+        self.last_pid = None
+        self.in_tol = None         # t desde el que |error| <= YAW_TOL de forma continua
 
     def _advance(self):
-        self.i += 1; self.step_start = None; self.yaw_prev = None; self.accum = 0.0
+        self.i += 1; self.step_start = None; self._turn_reset()
 
     def sticks(self, t, yaw):
         """Sticks para el paso actual; avanza al terminarlo. NEUTRAL cuando ya acabo todo."""
@@ -102,29 +123,55 @@ class MapSequencer:
             return NEUTRAL
         step = self.seq[self.i]
         if self.step_start is None:                    # primera iteracion del paso
-            self.step_start = t; self.yaw_prev = yaw; self.accum = 0.0
+            self.step_start = t
         if step[0] == "move":
             _, sticks, secs = step
             if t - self.step_start >= secs:
                 self._advance()
             return sticks
-        # ("turn", grados): lazo cerrado sobre el yaw
+        # ("turn", grados): lazo cerrado con el PID de yaw (EXP-035/036)
         _, deg = step
-        if yaw is not None and self.yaw_prev is not None:
-            dy = yaw - self.yaw_prev                    # des-envolver el salto +-180
-            if dy > 180: dy -= 360
-            elif dy < -180: dy += 360
-            self.accum += dy
-        if yaw is not None:
-            self.yaw_prev = yaw
-        remaining = deg - self.accum                    # >0 falta derecha, <0 falta izquierda
-        if abs(remaining) <= YAW_TOL or (t - self.step_start) > _turn_timeout(deg):
+        if yaw is None:                                # sin telemetria aun: no muevas el yaw
+            if (t - self.step_start) > _turn_timeout(deg, self.ramp):
+                self._advance()
+            return NEUTRAL
+        if self.pid is None:                           # arranca el giro con la 1a lectura valida
+            kp, ki, kd = self.gains
+            self.pid = YP.YawPID(kp, ki, kd, umax=self.umax)
+            self.gate = YP.YawGate()
+            self.sp = YP.wrap180(yaw + deg)            # objetivo ABSOLUTO relativo al rumbo actual
+            self.sp_cmd = None                         # la rampa arranca en el yaw actual
+            self.last_pid = t - TS_YAW                 # fuerza un recalculo inmediato
+        # recalcula el PID a ~10 Hz (cadencia del OSD); ZOH del stick entre recalculos
+        if t - self.last_pid >= TS_YAW:
+            dt = t - self.last_pid
+            yaw_ok, _ = self.gate.feed(yaw, t)         # descarta rumbos fisicamente imposibles
+            if self.ramp:
+                if self.sp_cmd is None:
+                    self.sp_cmd = yaw_ok
+                d = YP.wrap180(self.sp - self.sp_cmd)
+                step_max = self.ramp * dt
+                self.sp_cmd = YP.wrap180(self.sp_cmd + max(-step_max, min(step_max, d)))
+                target = self.sp_cmd
+            else:
+                target = self.sp
+            u, _, _, _, _ = self.pid.step(target, yaw_ok)
+            self.u_hold = u
+            self.last_pid = t
+            # cierre SOLO cuando la rampa ya llego al objetivo (si no, el error chico a media
+            # rampa cerraria el giro corto) Y el error al objetivo FINAL es pequeño y sostenido
+            ramp_done = (not self.ramp) or abs(YP.wrap180(self.sp - self.sp_cmd)) < 0.5
+            if ramp_done and abs(YP.wrap180(self.sp - yaw_ok)) <= YAW_TOL:
+                if self.in_tol is None:
+                    self.in_tol = t
+            else:
+                self.in_tol = None
+        settled = self.in_tol is not None and (t - self.in_tol) >= YAW_SETTLE
+        if settled or (t - self.step_start) > _turn_timeout(deg, self.ramp):
             self._advance()
             return NEUTRAL
-        # deflexion: fuerte casi todo el giro, baja cerca del objetivo pero SIN caer bajo 220
-        # (menos que eso el yaw-hold del FC lo frena y no cierra, como paso con el throttle).
-        yd = min(self.yd_max, max(220, int(abs(remaining) * 10.0)))
-        return (1024, 1024, 1024, 1024 + (yd if remaining > 0 else -yd))  # ch3+ der, ch3- izq
+        y = int(round(max(-self.umax, min(self.umax, self.u_hold))))
+        return (1024, 1024, 1024, 1024 + y)            # ch3+ der (yaw sube), ch3- izq
 
 
 def _receiver(s, st):
@@ -207,13 +254,16 @@ def _events_no_sticks(pcap, tmax):
 
 def run(args):
     real = args.fly and args.armed_ok
-    seq = MapSequencer(build_sequence(args.defl), int(args.yaw_defl))   # traslacion + giros lazo cerrado
+    seq = MapSequencer(build_sequence(args.defl), int(args.yaw_defl),   # traslacion + giros lazo cerrado
+                       args.yaw_kp, args.yaw_ki, args.yaw_kd, args.yaw_ramp)
     d_thr = max(0, min(int(args.climb_thr), 640))      # tope: 1024+640=1664 (< max 1684)
     climb_stick = (1024, 1024, 1024 + d_thr, 1024)     # throttle arriba FUERTE para subir
     print("=" * 64)
     print("  mapflight.py  —  %s" % ("VUELO + GRABACION" if real else "DRY (graba en tierra, sin despegar)"))
     print("  defl=%d  cam=%.0fdeg  ascenso=+%d x%.0fs (techo %.1fm)  giros: izq90/der180/izq90"
           % (args.defl, args.cam_pitch, args.climb_thr, args.climb_secs, args.alt))
+    print("  giros: PID yaw Kp=%.1f Ki=%.1f Kd=%.2f rampa=%.0f deg/s (lazo cerrado, EXP-035/036)"
+          % (args.yaw_kp, args.yaw_ki, args.yaw_kd, args.yaw_ramp))
     print("=" * 64)
     if args.fly and not args.armed_ok:
         print("!! --fly requiere --armed-ok. Abortado."); return
@@ -446,8 +496,19 @@ def main():
                          "no traslada, 250=visible (default), 350=amplio. Tope 500. Subir para "
                          "mas paralaje (necesita mas espacio); bajar si el cuarto es chico")
     ap.add_argument("--yaw-defl", dest="yaw_defl", type=float, default=600.0,
-                    help="deflexion del stick de YAW en los giros (separada de --defl; el Neo "
-                         "gira lento, ~6deg/s a 250). Default 600 (fuerte). Tope 640")
+                    help="SATURACION del stick de yaw en los giros (umax del PID; el rango real "
+                         "es +-660). Con --yaw-ramp el lazo casi no satura. Default 600, tope 660")
+    ap.add_argument("--yaw-kp", dest="yaw_kp", type=float, default=YP.KP,
+                    help="Kp del PID de yaw de los giros (EXP-035). Default el del usuario")
+    ap.add_argument("--yaw-ki", dest="yaw_ki", type=float, default=0.0,
+                    help="Ki del PID de yaw. Default 0: la planta YA es integrador, la I solo "
+                         "cuesta fase y reaviva el ciclo limite (EXP-036). RECOMENDADO 0")
+    ap.add_argument("--yaw-kd", dest="yaw_kd", type=float, default=YP.KD,
+                    help="Kd del PID de yaw (sobre la MEDIDA). Default el del usuario")
+    ap.add_argument("--yaw-ramp", dest="yaw_ramp", type=float, default=25.0, metavar="DEG_S",
+                    help="rampa el objetivo de yaw a DEG_S deg/s -> giro suave a velocidad "
+                         "~constante, sin saturar ni ciclo limite (EXP-036). 0 = escalon. "
+                         "Sube a ~40 para giros mas rapidos (el dron topa en 49.5)")
     ap.add_argument("--alt", type=float, default=1.5,
                     help="TECHO de seguridad del ascenso (m). El ascenso empuja throttle >= "
                          "--climb-secs, pero PARA si alcanza esta altura. Cuidado con el techo real")
