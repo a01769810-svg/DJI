@@ -71,6 +71,7 @@ def main():
     census = collections.Counter()
     osd = batt = gimb = None
     got_osd = got_batt = got_gimb = False
+    pos = N.PositionEstimator()          # (x,y,z) local por dead-reckoning de vgx/vgy (MVO)
     t0 = time.time()
     nt = {"stick": 0.0, "sub": 0.0, "ka": 0.0, "print": 0.0}
     print("--- telemetria (Ctrl+C para salir) ---", flush=True)
@@ -92,7 +93,9 @@ def main():
                 for snd, cset, cid, pl in N.scan_duml(d):
                     census[(snd, cset, cid)] += 1
                 o = N.find_osd_general(d)
-                if o: osd = o; got_osd = True
+                if o:
+                    osd = o; got_osd = True
+                    pos.update(o, now)          # integra la velocidad -> posicion local
                 b = N.find_battery_dynamic(d)
                 if b: batt = b; got_batt = True
                 g = N.find_gimbal_position(d)
@@ -101,6 +104,8 @@ def main():
                 nt["print"] = now + 0.5
                 if osd:
                     print("  t+%5.1f  %s" % (now - t0, fmt_osd(osd)), flush=True)
+                    print("           POS(dead-reckoning MVO) x=%+.2f y=%+.2f z=%.2f m  (camino %.2fm, DERIVA)"
+                          % (pos.x, pos.y, pos.z, pos.dist), flush=True)
                 if batt:
                     print("           BATT  %s" % fmt_batt(batt), flush=True)
                 if gimb:

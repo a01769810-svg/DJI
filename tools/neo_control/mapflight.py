@@ -280,6 +280,7 @@ def _receiver(s, st):
         o = N.find_osd_general(d)                      # estado del FC (para saber si arma)
         if o:
             st["osd"] = o
+            st["pos"].update(o, time.time())           # integra velocidad -> posicion local
         g = N.find_gimbal_position(d)                  # angulo de la camara (para apuntarla)
         if g:
             st["gpitch"] = g["gpitch"]
@@ -417,7 +418,8 @@ def run(args):
     print("hello -> ACK. comandos de arranque de video (sin sticks): %d  -> arrancando ya" % len(events), flush=True)
 
     st = {"vpkts": [], "vwrap": 0, "vlast": None, "max_vid": 0, "max_tel": 0,
-          "osd": None, "gpitch": None, "stop": False, "pv_frame": None, "pv_n": 0}
+          "osd": None, "gpitch": None, "stop": False, "pv_frame": None, "pv_n": 0,
+          "pos": N.PositionEstimator()}     # (x,y,z) local por dead-reckoning de vgx/vgy (MVO)
     rx = threading.Thread(target=_receiver, args=(s, st), daemon=True)
     rx.start()
     # video EN VIVO (--preview): decodifica en un hilo aparte; la ventana la pinta el hilo
@@ -496,6 +498,7 @@ def run(args):
                     if raw_send(s, auto_fly_mb):
                         print(">>> AUTO_FLY (despegue) ENVIADO en ventana en t+%.1f" % t, flush=True)
                         takeoff_sent = True
+                        st["pos"].reset()          # origen (0,0,0) en el punto de despegue
                 if takeoff_sent:
                     t_air = t - t_takeoff
                     h = st["osd"]["height_m"] if st["osd"] else 0.0
@@ -594,8 +597,9 @@ def run(args):
                 spd = ("%.1f" % (o["vgx"] ** 2 + o["vgy"] ** 2) ** 0.5) if o else "?"
                 cam = ("%.0fdeg" % st["gpitch"]) if st.get("gpitch") is not None else "?"
                 yaw = ("%.0f" % o["yaw"]) if o else "?"     # heading: para VER los giros cerrar
-                print("  t+%5.1f [%s] video=%d pkts, mot=%s alt=%s vH=%s cam=%s yaw=%s"
-                      % (t, phase, len(st["vpkts"]), mot, alt, spd, cam, yaw), flush=True)
+                p = st["pos"]                                # posicion local (dead-reckoning, DERIVA)
+                print("  t+%5.1f [%s] video=%d pkts, mot=%s alt=%s vH=%s cam=%s yaw=%s pos=(%+.1f,%+.1f,%.1f)"
+                      % (t, phase, len(st["vpkts"]), mot, alt, spd, cam, yaw, p.x, p.y, p.z), flush=True)
                 last_report = t
     except KeyboardInterrupt:
         print("\n!! Ctrl+C -> ATERRIZANDO (throttle-min)", flush=True)

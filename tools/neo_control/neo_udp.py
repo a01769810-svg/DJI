@@ -362,6 +362,51 @@ def find_osd_general(pkt):
     return None
 
 
+class PositionEstimator:
+    """Estimacion de posicion LOCAL (x,y,z) del Neo por DEAD-RECKONING: integra la velocidad
+    del OSD (vgx/vgy = salida del MVO, la odometria visual del propio Neo, en marco MUNDO fijo).
+    z se toma DIRECTO de la altura (mejor que integrar vgz). Origen (0,0,0) en el primer sample
+    o en reset() (p.ej. al despegar).
+
+    ⚠️ DERIVA: integra velocidad cuantizada a 0.1 m/s -> el error crece con el tiempo (metros en
+    decenas de s). Es odometria de CORTO PLAZO, NO un mapa metrico (eso lo da el SLAM). Pero la
+    fuente ES la posicion visual del Neo (mvo_used), no un invento. Ver la investigacion en la
+    memoria neo-local-position-routes. 'dist' acumula el camino horizontal (para juzgar la deriva)."""
+
+    def __init__(self):
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.dist = 0.0          # distancia horizontal recorrida (integral de |v|)
+        self.t_prev = None
+        self.n = 0
+
+    def reset(self, z=0.0):
+        self.x = self.y = 0.0
+        self.z = z
+        self.dist = 0.0
+        self.t_prev = None
+        self.n = 0
+
+    def update(self, osd, t):
+        """Integra un sample. osd = dict de decode_osd_general; t = time.time().
+        Devuelve (x, y, z). z sale de height_m; x,y de integrar vgx/vgy."""
+        if osd is None:
+            return self.x, self.y, self.z
+        self.z = osd.get("height_m", self.z)
+        if self.t_prev is not None:
+            dt = t - self.t_prev
+            if 0.0 < dt < 1.0:                    # ignora huecos grandes de telemetria
+                dx = osd.get("vgx", 0.0) * dt
+                dy = osd.get("vgy", 0.0) * dt
+                self.x += dx
+                self.y += dy
+                self.dist += (dx * dx + dy * dy) ** 0.5
+                self.n += 1
+        self.t_prev = t
+        return self.x, self.y, self.z
+
+
 # --- Battery Dynamic Data 0x0d/0x02: voltaje/corriente/capacidad/temperatura ---
 # Layout autoritativo (dji-firmware-tools, battery_dynamic_data_dissector), forma
 # comun de 30/31 bytes con 1 byte (index/result) antes del voltaje:
