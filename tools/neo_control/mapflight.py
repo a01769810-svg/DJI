@@ -267,56 +267,47 @@ def _receiver(s, st):
 
 
 def _decode_thread(st):
-    """VIDEO EN VIVO (--preview): DECODIFICA en un hilo aparte y deja el ultimo frame BGR en
-    st['pv_frame']; la VENTANA la pinta el HILO PRINCIPAL (GUI de OpenCV solo fiable ahi en
-    Windows). No toca el control (solo LEE st['vpkts']).
+    """VIDEO EN VIVO (--preview): DECODIFICA en un hilo aparte con un CodecContext HEVC
+    PERSISTENTE de PyAV y deja el ultimo frame BGR en st['pv_frame']; la VENTANA la pinta el
+    HILO PRINCIPAL (GUI de OpenCV solo fiable ahi en Windows). No toca el control (solo LEE
+    st['vpkts']).
 
-    Metodo: cada ~1s reensambla (V._reassemble_frames dedup+ordena; el crudo no decodifica),
-    escribe un .h265 temporal desde el keyframe y lo decodifica con cv2.VideoCapture quedandose
-    con el ULTIMO frame. Por que asi y no incremental (todo MEDIDO):
-      - el stream tiene 1 SOLO keyframe -> no hay 'ultimo GOP' barato;
-      - VideoCapture sobre un archivo que crece NO devuelve frames nuevos tras EOF;
-      - PyAV crudo (CodecContext.parse) NO decodifica fiable este stream.
-    Coste: ~1.3s por decode de ~2MB -> preview tipo 'slideshow' ~0.7 fps, ~1.5s de latencia.
-    Fiable y suficiente para SUPERVISAR la cobertura; no es FPV suave (haria falta que el encoder
-    emitiera mas keyframes, que no controlamos)."""
+    CLAVE (lo que costo dar con ello): el flag **'showall'** (FFmpeg 8.1.2 / PyAV 18) hace que
+    el decoder EMITA los frames corruptos. Nuestro stream en vivo pierde paquetes; sin showall
+    PyAV los DESCARTA y salian ~0 frames (medido: 299 vs 1852 con el flag). Se alimenta el
+    stream REENSAMBLADO de forma INCREMENTAL (cursor de bytes): el CodecContext mantiene estado
+    -> cada frame se decodifica UNA sola vez -> ~14x tiempo real, sin relag. (El intento previo
+    con cv2.VideoCapture redecodificaba el archivo entero cada vez y crecia sin fin = 'muy lento'.)"""
     import time as _t
-    import os
-    import tempfile
     try:
-        import cv2
+        import av
+        av.logging.set_level(av.logging.PANIC)   # silencia el flood de 'PPS out of range'/'POC' etc.
     except Exception as e:
-        print("!! --preview: no hay cv2 en este python (%s). Corre via neo.ps1 (.venv)." % e, flush=True)
+        print("!! --preview: falta PyAV (%s). Corre via neo.ps1 (.venv)." % e, flush=True)
         st["pv_err"] = True
         return
-    tmp = os.path.join(tempfile.gettempdir(), "neo_preview.h265")
-    seen = 0
+    try:
+        import cv2                                # solo para resize (el imshow lo hace main)
+    except Exception:
+        cv2 = None
+    ctx = av.CodecContext.create("hevc", "r")
+    ctx.options = {"flags2": "+showall", "err_detect": "ignore_err"}   # emitir frames corruptos
+    cursor = 0
     while not st["stop"]:
-        n = len(st["vpkts"])
-        if n > seen + 8:                                      # hay paquetes nuevos que valga la pena
-            seen = n
-            es, _, _ = V._reassemble_frames(list(st["vpkts"]))   # copia -> no toca la lista compartida
-            k = es.find(b"\x00\x00\x00\x01\x40")              # arranca en el keyframe (VPS)
-            if k > 0:
-                es = es[k:]
-            if len(es) > 4096:
-                try:
-                    with open(tmp, "wb") as fh:
-                        fh.write(es)
-                    cap = cv2.VideoCapture(tmp)
-                    last = None
-                    while True:
-                        r, fr = cap.read()
-                        if not r:
-                            break
-                        last = fr
-                    cap.release()
-                    if last is not None:
-                        st["pv_frame"] = cv2.resize(last, (960, 540))
+        es, _, _ = V._reassemble_frames(list(st["vpkts"]))   # copia -> no toca la lista compartida
+        if len(es) > cursor:
+            try:
+                for pkt in ctx.parse(es[cursor:]):           # el parser bufferiza NALs parciales
+                    for fr in ctx.decode(pkt):
+                        img = fr.to_ndarray(format="bgr24")
+                        if cv2 is not None:
+                            img = cv2.resize(img, (960, 540))
+                        st["pv_frame"] = img
                         st["pv_n"] = st.get("pv_n", 0) + 1
-                except Exception:
-                    pass
-        _t.sleep(1.0)
+            except Exception:
+                pass                                          # frame malo -> seguir
+            cursor = len(es)
+        _t.sleep(0.2)
 
 
 def raw_send(s, mb):
@@ -682,9 +673,9 @@ def main():
                     help="velocidad del barrido de camara (deg/s). Default 12 (suave); fondo "
                          "fisico 26.2. Mas lento = video mas nitido, mas rapido = mas cobertura/s")
     ap.add_argument("--preview", action="store_true",
-                    help="muestra el VIDEO EN VIVO en una ventana durante la corrida (decode en "
-                         "hilo aparte, no toca el control). 'Slideshow' ~0.7 fps con ~1.5s de "
-                         "latencia (el stream tiene 1 keyframe, no da FPV suave). Requiere cv2 -> "
+                    help="muestra el VIDEO EN VIVO en una ventana durante la corrida (decode PyAV "
+                         "incremental en hilo aparte, no toca el control; flag 'showall' para "
+                         "emitir frames aunque haya perdida de paquetes). Requiere PyAV+cv2 -> "
                          "corre via neo.ps1 (usa el .venv). Pruebalo primero en DRY (en tierra)")
     ap.add_argument("--out", default="map_video.h265", help="archivo de video de salida")
     ap.add_argument("--decode", metavar="FILE", default=None, help="decodificar un .h265 (usa el .venv)")
