@@ -64,9 +64,14 @@ try {
         return
     }
     Write-Host "Conectado al Neo: $ip" -ForegroundColor Green
-    Write-Host "Corriendo: python $script $rest" -ForegroundColor Cyan
+    # Preferir el Python del .venv (tiene cv2 + PyAV -> habilita --preview de video en vivo,
+    # y es superset del stdlib: corre el stack de control identico). Si no existe, usa 'python'.
+    $py = "python"
+    $venvPy = Join-Path $PSScriptRoot "..\..\.venv\Scripts\python.exe"
+    if (Test-Path $venvPy) { $py = $venvPy }
+    Write-Host "Corriendo: $py $script $rest" -ForegroundColor Cyan
     Push-Location $PSScriptRoot
-    & python $script @rest      # salida en vivo: VOLAR (input) y Ctrl+C=AUTO_LANDING funcionan
+    & $py $script @rest         # salida en vivo: VOLAR (input) y Ctrl+C=AUTO_LANDING funcionan
     Pop-Location
 }
 finally {

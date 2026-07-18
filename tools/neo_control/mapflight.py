@@ -266,6 +266,56 @@ def _receiver(s, st):
             st["gpitch"] = g["gpitch"]
 
 
+def _preview_thread(st):
+    """VIDEO EN VIVO (--preview). Alimenta los payloads de video a un decodificador HEVC
+    PERSISTENTE de PyAV (decode incremental: cada frame se decodifica UNA vez, ~300 fps) y
+    muestra el ultimo frame con cv2.imshow. Corre en su PROPIO hilo: NO toca el lazo de
+    control ni el receptor (solo LEE st['vpkts']). Todas las llamadas HighGUI/av en este hilo.
+
+    Por que un hilo y PyAV y no OpenCV: OpenCV no hace decode incremental de nuestro stream
+    que crece (el stream tiene 1 solo keyframe -> redecodificar desde el inicio cada vez
+    laggea peor y peor, medido ~4s). PyAV mantiene el estado del decoder y consume paquetes."""
+    import time as _t
+    try:
+        import av
+        import cv2
+    except Exception as e:
+        print("!! --preview desactivado: falta PyAV/cv2 en este python (%s)." % e, flush=True)
+        print("   corre via neo.ps1 (usa el .venv) o instala: .venv\\Scripts\\python -m pip install av", flush=True)
+        return
+    cc = av.CodecContext.create("hevc", "r")
+    win = "Neo LIVE (preview)"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 960, 540)
+    fed = 0
+    last = None
+    print(">>> preview de video EN VIVO abierto (ventana '%s')" % win, flush=True)
+    while not st["stop"]:
+        pk = st["vpkts"]
+        n = len(pk)
+        if n > fed:                                    # payloads nuevos -> alimenta el decoder
+            buf = b"".join(bytes(pk[i][1][V.SUBHDR:]) for i in range(fed, n))
+            fed = n
+            try:
+                for pkt in cc.parse(buf):
+                    for fr in cc.decode(pkt):
+                        last = fr
+            except Exception:
+                pass                                    # perdida de paquetes -> artefactos, seguir
+        if last is not None:
+            try:
+                img = last.to_ndarray(format="bgr24")
+                cv2.imshow(win, img)
+                cv2.waitKey(1)
+            except Exception:
+                pass
+        _t.sleep(0.05)
+    try:
+        cv2.destroyWindow(win)
+    except Exception:
+        pass
+
+
 def raw_send(s, mb):
     """Envia un frame MB como type-5 CRUDO (sin el _pump que descarta video) pero FIABLE:
     respeta la ventana RX del dron y CACHEA el paquete para poder retransmitirlo.
@@ -352,6 +402,8 @@ def run(args):
           "osd": None, "gpitch": None, "stop": False}
     rx = threading.Thread(target=_receiver, args=(s, st), daemon=True)
     rx.start()
+    if args.preview:                                   # video EN VIVO en su propio hilo (no toca control)
+        threading.Thread(target=_preview_thread, args=(st,), daemon=True).start()
 
     t0 = time.time()
     ei = 0
@@ -596,6 +648,10 @@ def main():
     ap.add_argument("--gimbal-rate", dest="gimbal_rate", type=float, default=GIMBAL_RATE_DEF,
                     help="velocidad del barrido de camara (deg/s). Default 12 (suave); fondo "
                          "fisico 26.2. Mas lento = video mas nitido, mas rapido = mas cobertura/s")
+    ap.add_argument("--preview", action="store_true",
+                    help="muestra el VIDEO EN VIVO en una ventana durante la corrida (hilo aparte, "
+                         "no toca el control). Requiere PyAV y cv2 -> corre via neo.ps1 (usa el .venv). "
+                         "Pruebalo primero en DRY (en tierra)")
     ap.add_argument("--out", default="map_video.h265", help="archivo de video de salida")
     ap.add_argument("--decode", metavar="FILE", default=None, help="decodificar un .h265 (usa el .venv)")
     args = ap.parse_args()
