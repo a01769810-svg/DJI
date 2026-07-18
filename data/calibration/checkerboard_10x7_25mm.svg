@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="250mm" height="175mm" viewBox="0 0 250 175">
+<rect width="250" height="175" fill="white"/>
+<rect x="0" y="0" width="25" height="25" fill="black"/>
+<rect x="50" y="0" width="25" height="25" fill="black"/>
+<rect x="100" y="0" width="25" height="25" fill="black"/>
+<rect x="150" y="0" width="25" height="25" fill="black"/>
+<rect x="200" y="0" width="25" height="25" fill="black"/>
+<rect x="25" y="25" width="25" height="25" fill="black"/>
+<rect x="75" y="25" width="25" height="25" fill="black"/>
+<rect x="125" y="25" width="25" height="25" fill="black"/>
+<rect x="175" y="25" width="25" height="25" fill="black"/>
+<rect x="225" y="25" width="25" height="25" fill="black"/>
+<rect x="0" y="50" width="25" height="25" fill="black"/>
+<rect x="50" y="50" width="25" height="25" fill="black"/>
+<rect x="100" y="50" width="25" height="25" fill="black"/>
+<rect x="150" y="50" width="25" height="25" fill="black"/>
+<rect x="200" y="50" width="25" height="25" fill="black"/>
+<rect x="25" y="75" width="25" height="25" fill="black"/>
+<rect x="75" y="75" width="25" height="25" fill="black"/>
+<rect x="125" y="75" width="25" height="25" fill="black"/>
+<rect x="175" y="75" width="25" height="25" fill="black"/>
+<rect x="225" y="75" width="25" height="25" fill="black"/>
+<rect x="0" y="100" width="25" height="25" fill="black"/>
+<rect x="50" y="100" width="25" height="25" fill="black"/>
+<rect x="100" y="100" width="25" height="25" fill="black"/>
+<rect x="150" y="100" width="25" height="25" fill="black"/>
+<rect x="200" y="100" width="25" height="25" fill="black"/>
+<rect x="25" y="125" width="25" height="25" fill="black"/>
+<rect x="75" y="125" width="25" height="25" fill="black"/>
+<rect x="125" y="125" width="25" height="25" fill="black"/>
+<rect x="175" y="125" width="25" height="25" fill="black"/>
+<rect x="225" y="125" width="25" height="25" fill="black"/>
+<rect x="0" y="150" width="25" height="25" fill="black"/>
+<rect x="50" y="150" width="25" height="25" fill="black"/>
+<rect x="100" y="150" width="25" height="25" fill="black"/>
+<rect x="150" y="150" width="25" height="25" fill="black"/>
+<rect x="200" y="150" width="25" height="25" fill="black"/>
+</svg>
