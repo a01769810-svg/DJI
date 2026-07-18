@@ -266,54 +266,57 @@ def _receiver(s, st):
             st["gpitch"] = g["gpitch"]
 
 
-def _preview_thread(st):
-    """VIDEO EN VIVO (--preview). Alimenta los payloads de video a un decodificador HEVC
-    PERSISTENTE de PyAV (decode incremental: cada frame se decodifica UNA vez, ~300 fps) y
-    muestra el ultimo frame con cv2.imshow. Corre en su PROPIO hilo: NO toca el lazo de
-    control ni el receptor (solo LEE st['vpkts']). Todas las llamadas HighGUI/av en este hilo.
+def _decode_thread(st):
+    """VIDEO EN VIVO (--preview): DECODIFICA en un hilo aparte y deja el ultimo frame BGR en
+    st['pv_frame']; la VENTANA la pinta el HILO PRINCIPAL (GUI de OpenCV solo fiable ahi en
+    Windows). No toca el control (solo LEE st['vpkts']).
 
-    Por que un hilo y PyAV y no OpenCV: OpenCV no hace decode incremental de nuestro stream
-    que crece (el stream tiene 1 solo keyframe -> redecodificar desde el inicio cada vez
-    laggea peor y peor, medido ~4s). PyAV mantiene el estado del decoder y consume paquetes."""
+    Metodo: cada ~1s reensambla (V._reassemble_frames dedup+ordena; el crudo no decodifica),
+    escribe un .h265 temporal desde el keyframe y lo decodifica con cv2.VideoCapture quedandose
+    con el ULTIMO frame. Por que asi y no incremental (todo MEDIDO):
+      - el stream tiene 1 SOLO keyframe -> no hay 'ultimo GOP' barato;
+      - VideoCapture sobre un archivo que crece NO devuelve frames nuevos tras EOF;
+      - PyAV crudo (CodecContext.parse) NO decodifica fiable este stream.
+    Coste: ~1.3s por decode de ~2MB -> preview tipo 'slideshow' ~0.7 fps, ~1.5s de latencia.
+    Fiable y suficiente para SUPERVISAR la cobertura; no es FPV suave (haria falta que el encoder
+    emitiera mas keyframes, que no controlamos)."""
     import time as _t
+    import os
+    import tempfile
     try:
-        import av
         import cv2
     except Exception as e:
-        print("!! --preview desactivado: falta PyAV/cv2 en este python (%s)." % e, flush=True)
-        print("   corre via neo.ps1 (usa el .venv) o instala: .venv\\Scripts\\python -m pip install av", flush=True)
+        print("!! --preview: no hay cv2 en este python (%s). Corre via neo.ps1 (.venv)." % e, flush=True)
+        st["pv_err"] = True
         return
-    cc = av.CodecContext.create("hevc", "r")
-    win = "Neo LIVE (preview)"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, 960, 540)
-    fed = 0
-    last = None
-    print(">>> preview de video EN VIVO abierto (ventana '%s')" % win, flush=True)
+    tmp = os.path.join(tempfile.gettempdir(), "neo_preview.h265")
+    seen = 0
     while not st["stop"]:
-        pk = st["vpkts"]
-        n = len(pk)
-        if n > fed:                                    # payloads nuevos -> alimenta el decoder
-            buf = b"".join(bytes(pk[i][1][V.SUBHDR:]) for i in range(fed, n))
-            fed = n
-            try:
-                for pkt in cc.parse(buf):
-                    for fr in cc.decode(pkt):
+        n = len(st["vpkts"])
+        if n > seen + 8:                                      # hay paquetes nuevos que valga la pena
+            seen = n
+            es, _, _ = V._reassemble_frames(list(st["vpkts"]))   # copia -> no toca la lista compartida
+            k = es.find(b"\x00\x00\x00\x01\x40")              # arranca en el keyframe (VPS)
+            if k > 0:
+                es = es[k:]
+            if len(es) > 4096:
+                try:
+                    with open(tmp, "wb") as fh:
+                        fh.write(es)
+                    cap = cv2.VideoCapture(tmp)
+                    last = None
+                    while True:
+                        r, fr = cap.read()
+                        if not r:
+                            break
                         last = fr
-            except Exception:
-                pass                                    # perdida de paquetes -> artefactos, seguir
-        if last is not None:
-            try:
-                img = last.to_ndarray(format="bgr24")
-                cv2.imshow(win, img)
-                cv2.waitKey(1)
-            except Exception:
-                pass
-        _t.sleep(0.05)
-    try:
-        cv2.destroyWindow(win)
-    except Exception:
-        pass
+                    cap.release()
+                    if last is not None:
+                        st["pv_frame"] = cv2.resize(last, (960, 540))
+                        st["pv_n"] = st.get("pv_n", 0) + 1
+                except Exception:
+                    pass
+        _t.sleep(1.0)
 
 
 def raw_send(s, mb):
@@ -399,15 +402,26 @@ def run(args):
     print("hello -> ACK. comandos de arranque de video (sin sticks): %d  -> arrancando ya" % len(events), flush=True)
 
     st = {"vpkts": [], "vwrap": 0, "vlast": None, "max_vid": 0, "max_tel": 0,
-          "osd": None, "gpitch": None, "stop": False}
+          "osd": None, "gpitch": None, "stop": False, "pv_frame": None, "pv_n": 0}
     rx = threading.Thread(target=_receiver, args=(s, st), daemon=True)
     rx.start()
-    if args.preview:                                   # video EN VIVO en su propio hilo (no toca control)
-        threading.Thread(target=_preview_thread, args=(st,), daemon=True).start()
+    # video EN VIVO (--preview): decodifica en un hilo aparte; la ventana la pinta el hilo
+    # principal (GUI de OpenCV solo fiable ahi en Windows). cv2 se importa aqui.
+    pv_cv2 = None
+    pv_win = "Neo LIVE (preview)"
+    pv_shown = False
+    if args.preview:
+        try:
+            import cv2 as pv_cv2
+        except Exception as e:
+            print("!! --preview: no hay cv2 en este python (%s). Corre via neo.ps1 (.venv)." % e, flush=True)
+            pv_cv2 = None
+        threading.Thread(target=_decode_thread, args=(st,), daemon=True).start()
 
     t0 = time.time()
     ei = 0
     last_ack = last_stick = last_report = last_mode = last_auth = last_retx = last_gimbal = -1.0
+    last_pv = -1.0
     wctr = 0xA000; mdseq = 0xd000; adseq = 0xc000
     takeoff_sent = False
     pre_to_reported = False        # ¿ya imprimimos el OSD pre-despegue? (una vez)
@@ -534,6 +548,19 @@ def run(args):
                 if raw_send(s, N.wrap_5101(wctr, N.gimbal_control_frame(mdseq, int(vp)))):
                     wctr = (wctr + 1) & 0xffffffff; mdseq = (mdseq + 1) & 0xffff
                 last_gimbal = t
+            # 4c) PREVIEW: pinta el ultimo frame decodificado (por _decode_thread) EN EL HILO
+            #     PRINCIPAL. imshow+waitKey(1) ~1-2ms cada 100ms: despreciable para el control.
+            if args.preview and pv_cv2 is not None and t - last_pv >= 0.1:
+                fr = st["pv_frame"]
+                if fr is not None:
+                    if not pv_shown:
+                        pv_cv2.namedWindow(pv_win, pv_cv2.WINDOW_NORMAL)
+                        pv_cv2.resizeWindow(pv_win, 960, 540)
+                        pv_shown = True
+                        print(">>> preview de video EN VIVO abierto (ventana '%s')" % pv_win, flush=True)
+                    pv_cv2.imshow(pv_win, fr)
+                    pv_cv2.waitKey(1)
+                last_pv = t
             # 5) reporte
             if t - last_report >= 1.0:
                 if not real:            phase = "DRY"
@@ -566,6 +593,12 @@ def run(args):
     finally:
         st["stop"] = True
         time.sleep(0.3)
+        if pv_cv2 is not None and pv_shown:
+            try:
+                pv_cv2.destroyAllWindows()
+                pv_cv2.waitKey(1)
+            except Exception:
+                pass
         s.sock.close()
 
     # guardar video (frames completos, recortado al primer keyframe)
@@ -649,9 +682,10 @@ def main():
                     help="velocidad del barrido de camara (deg/s). Default 12 (suave); fondo "
                          "fisico 26.2. Mas lento = video mas nitido, mas rapido = mas cobertura/s")
     ap.add_argument("--preview", action="store_true",
-                    help="muestra el VIDEO EN VIVO en una ventana durante la corrida (hilo aparte, "
-                         "no toca el control). Requiere PyAV y cv2 -> corre via neo.ps1 (usa el .venv). "
-                         "Pruebalo primero en DRY (en tierra)")
+                    help="muestra el VIDEO EN VIVO en una ventana durante la corrida (decode en "
+                         "hilo aparte, no toca el control). 'Slideshow' ~0.7 fps con ~1.5s de "
+                         "latencia (el stream tiene 1 keyframe, no da FPV suave). Requiere cv2 -> "
+                         "corre via neo.ps1 (usa el .venv). Pruebalo primero en DRY (en tierra)")
     ap.add_argument("--out", default="map_video.h265", help="archivo de video de salida")
     ap.add_argument("--decode", metavar="FILE", default=None, help="decodificar un .h265 (usa el .venv)")
     args = ap.parse_args()
