@@ -17,8 +17,8 @@ MODOS:
                       Valida la maquina combinada de forma SEGURA.
   --fly --armed-ok    VUELO REAL de mapeo: estabiliza video -> despega -> SUBE a --alt
                       (throttle, lazo cerrado con la altura) -> patron: traslacion (paralaje)
-                      + giros de yaw en LAZO CERRADO con PID (cobertura) -> aterriza. La camara se
-                      apunta a --cam-pitch (abajo) en lazo cerrado. Los flags son la confirmacion.
+                      + giros de yaw con PID (cobertura), BARRIENDO la camara con su PID de
+                      velocidad para escanear las zonas -> aterriza. Los flags son la confirmacion.
 
 SEGURIDAD: patron simetrico (vuelve ~al inicio), deflexion baja, tope de tiempo (--cap),
 Ctrl+C = ATERRIZA (throttle-min). El video se graba y decodifica igual que video.py.
@@ -34,6 +34,8 @@ import neo_udp as N
 import flight as F
 import video as V
 import yaw_pid as YP        # reusa el PID de yaw validado en EXP-035/036 (YawPID/YawGate/rampa)
+import gimbal_pid as GP      # reusa el PID de VELOCIDAD del gimbal (EXP-038) para el barrido
+from sysid_gimbal import cmd_for_rate, MAX_CMD as GMAX, CENTER as GCEN   # inversion zona-muerta+expo
 
 PCAP_DEFAULT = "C:\\Users\\santi\\Desktop\\DJI project\\Novena captura.pcap"
 
@@ -174,6 +176,63 @@ class MapSequencer:
         return (1024, 1024, 1024, 1024 + y)            # ch3+ der (yaw sube), ch3- izq
 
 
+# --- barrido de camara (tilt) con el PID de VELOCIDAD del gimbal (EXP-038) ---
+# "siempre escanear moviendo el gimbal para cubrir las zonas": se barre a velocidad
+# ~CONSTANTE entre [lo, hi] reusando su RatePID + la inversion zona-muerta/expo
+# (cmd_for_rate). Reversa al llegar a cada extremo. Rate constante = video suave = mejor
+# tracking de features para SLAM. NO usa lazo de ANGULO (aun sin tunear); el rate PID + la
+# reversa por angulo bastan para recorrer el rango. Topes fisicos del gimbal: -90..+60.
+GIMBAL_LO_DEF, GIMBAL_HI_DEF = -75.0, 0.0     # barrido: del suelo (-75) al horizonte (0)
+GIMBAL_RATE_DEF = 12.0                          # deg/s del barrido (suave; fondo fisico 26.2)
+GIMBAL_MARGIN = 5.0                             # deg antes del extremo para invertir
+
+
+class GimbalScanner:
+    """Barre el tilt de la camara a velocidad constante entre [lo,hi] con el PID de velocidad
+    del usuario (gimbal_pid.RatePID, EXP-038), tal cual. Devuelve el valor 0x04/0x01 (1024=quieta)."""
+    def __init__(self, lo, hi, rate, margin=GIMBAL_MARGIN):
+        self.lo, self.hi = min(lo, hi), max(lo, hi)
+        self.rate = abs(rate)
+        self.margin = margin
+        self.pid = GP.RatePID()                 # su PID de velocidad, sin tocar
+        self.dir = -1
+        self.g_prev = None
+        self.t_prev = None
+        self.u_hold = 0.0
+
+    def value(self, t, gpitch):
+        """Comando de velocidad del gimbal para este instante. gpitch None -> no mover."""
+        if gpitch is None:
+            return GCEN
+        if self.g_prev is None:                 # 1a lectura: elige direccion hacia el rango
+            self.g_prev, self.t_prev = gpitch, t
+            self.dir = 1 if gpitch < (self.lo + self.hi) / 2 else -1
+            return GCEN
+        dt = t - self.t_prev
+        if dt <= 0:                             # ZOH si no hay muestra nueva
+            return int(GCEN + max(-GMAX, min(GMAX, cmd_for_rate(self.u_hold))))
+        rate_med = (gpitch - self.g_prev) / dt  # diferencia HACIA ATRAS (causal), como EXP-038
+        self.g_prev, self.t_prev = gpitch, t
+        if self.dir > 0 and gpitch >= self.hi - self.margin:      # reversa en los extremos
+            self.dir = -1
+        elif self.dir < 0 and gpitch <= self.lo + self.margin:
+            self.dir = 1
+        u = self.pid.step(self.dir * self.rate, rate_med, dt)[0]   # PID sobre error de velocidad
+        self.u_hold = u
+        return int(GCEN + max(-GMAX, min(GMAX, cmd_for_rate(u))))  # rate_cmd -> stick (inv. expo)
+
+
+def _point_value(gpitch, target):
+    """Apunta el gimbal a 'target' deg con control proporcional simple (parking pre-mapeo)."""
+    if gpitch is None:
+        return GCEN
+    err = target - gpitch                        # >0 subir, <0 bajar
+    if abs(err) <= 2.0:
+        return GCEN                              # llegado: HOLD
+    mag = min(400, max(130, abs(err) * 40))
+    return GCEN + (mag if err > 0 else -mag)
+
+
 def _receiver(s, st):
     """Hilo que SOLO recibe: captura video (con subheader) y mantiene la ventana RX del dron."""
     while not st["stop"]:
@@ -256,14 +315,17 @@ def run(args):
     real = args.fly and args.armed_ok
     seq = MapSequencer(build_sequence(args.defl), int(args.yaw_defl),   # traslacion + giros lazo cerrado
                        args.yaw_kp, args.yaw_ki, args.yaw_kd, args.yaw_ramp)
+    scanner = GimbalScanner(args.gimbal_lo, args.gimbal_hi, args.gimbal_rate)   # barrido de camara
     d_thr = max(0, min(int(args.climb_thr), 640))      # tope: 1024+640=1664 (< max 1684)
     climb_stick = (1024, 1024, 1024 + d_thr, 1024)     # throttle arriba FUERTE para subir
     print("=" * 64)
     print("  mapflight.py  —  %s" % ("VUELO + GRABACION" if real else "DRY (graba en tierra, sin despegar)"))
-    print("  defl=%d  cam=%.0fdeg  ascenso=+%d x%.0fs (techo %.1fm)  giros: izq90/der180/izq90"
-          % (args.defl, args.cam_pitch, args.climb_thr, args.climb_secs, args.alt))
+    print("  defl=%d  ascenso a %.1fm (+%d x%.0fs, tope seg. %.1fm)  giros: izq90/der180/izq90"
+          % (args.defl, args.alt, args.climb_thr, args.climb_secs, args.alt_max))
     print("  giros: PID yaw Kp=%.1f Ki=%.1f Kd=%.2f rampa=%.0f deg/s (lazo cerrado, EXP-035/036)"
           % (args.yaw_kp, args.yaw_ki, args.yaw_kd, args.yaw_ramp))
+    print("  camara: BARRIDO %.0f..%.0f deg @ %.0f deg/s con PID de velocidad (EXP-038)"
+          % (args.gimbal_lo, args.gimbal_hi, args.gimbal_rate))
     print("=" * 64)
     if args.fly and not args.armed_ok:
         print("!! --fly requiere --armed-ok. Abortado."); return
@@ -377,11 +439,17 @@ def run(args):
                         # empuja SOLO con altura valida (>=0.3); si no, deja al FC su auto-despegue
                         sticks = climb_stick if h >= 0.3 else NEUTRAL
                     else:
-                        # fase MAP: secuenciador (traslacion lazo abierto + giros lazo cerrado)
+                        # fase MAP: secuenciador (traslacion lazo abierto + giros con PID de yaw)
                         yaw = st["osd"]["yaw"] if st["osd"] else None
                         sticks = seq.sticks(t, yaw)
-                        # aterriza al COMPLETAR la secuencia, o si se rebasa el tope --cap
-                        if seq.done or (t - t_pat) >= args.cap:
+                        # aterriza si: la altura supera el tope de seguridad, se COMPLETA la
+                        # secuencia, o se rebasa el tope de tiempo --cap
+                        if h > args.alt_max:
+                            landing = True; land_start = t
+                            print(">>> ALTURA %.1fm > tope %.1fm -> ATERRIZANDO (seguridad)"
+                                  % (h, args.alt_max), flush=True)
+                            sticks = F.THROTTLE_MIN
+                        elif seq.done or (t - t_pat) >= args.cap:
                             landing = True; land_start = t
                             print(">>> patron %s -> ATERRIZANDO (throttle-min)"
                                   % ("completo" if seq.done else "cortado por tope --cap"), flush=True)
@@ -404,20 +472,13 @@ def run(args):
                     if raw_send(s, N.authority_frame(adseq, int(time.time()), 0x02)):
                         adseq = (adseq + 1) & 0xffff
                     last_auth = t
-            # 4b) CAMARA: apuntar a --cam-pitch en lazo cerrado (gpitch del OSD gimbal).
-            #     0x04/0x01 velocidad envuelta: 1024=quieta, <1024 baja, >1024 sube. Corre
-            #     siempre (tambien en DRY, para validar en tierra que la camara baja).
-            if t - last_gimbal >= 0.15:
+            # 4b) CAMARA (0x04/0x01, 1024=quieta). En MAPEO (y en DRY, para validar en tierra):
+            #     BARRIDO a velocidad constante con el PID del gimbal (EXP-038) para escanear las
+            #     zonas. Antes del mapeo (suelo/ascenso) o aterrizando: apunta a --cam-pitch.
+            if t - last_gimbal >= 0.1:
                 gp = st.get("gpitch")
-                if gp is None:
-                    vp = 1024                             # sin lectura aun: no mover
-                else:
-                    err = args.cam_pitch - gp             # >0 subir, <0 bajar
-                    if abs(err) <= 2.0:
-                        vp = 1024                         # llegado: HOLD
-                    else:
-                        mag = min(400, max(130, abs(err) * 40))
-                        vp = 1024 + (mag if err > 0 else -mag)
+                scanning = (not real) or (climbed and not landing)
+                vp = scanner.value(t, gp) if scanning else _point_value(gp, args.cam_pitch)
                 if raw_send(s, N.wrap_5101(wctr, N.gimbal_control_frame(mdseq, int(vp)))):
                     wctr = (wctr + 1) & 0xffffffff; mdseq = (mdseq + 1) & 0xffff
                 last_gimbal = t
@@ -509,20 +570,32 @@ def main():
                     help="rampa el objetivo de yaw a DEG_S deg/s -> giro suave a velocidad "
                          "~constante, sin saturar ni ciclo limite (EXP-036). 0 = escalon. "
                          "Sube a ~40 para giros mas rapidos (el dron topa en 49.5)")
-    ap.add_argument("--alt", type=float, default=1.5,
-                    help="TECHO de seguridad del ascenso (m). El ascenso empuja throttle >= "
-                         "--climb-secs, pero PARA si alcanza esta altura. Cuidado con el techo real")
+    ap.add_argument("--alt", type=float, default=2.0,
+                    help="altura de MAPEO objetivo (m). El ascenso empuja throttle >= --climb-secs "
+                         "pero PARA si alcanza esta altura. Default 2.0 (techo del cuarto ~3.24m)")
+    ap.add_argument("--alt-max", dest="alt_max", type=float, default=2.8,
+                    help="TOPE DURO de altura (m): si en mapeo la altura lo supera, ATERRIZA. "
+                         "Seguridad contra deriva hacia el techo. Default 2.8")
     ap.add_argument("--climb-thr", dest="climb_thr", type=float, default=450.0,
                     help="fuerza del throttle de subida sobre 1024 (el auto-despegue resiste "
                          "empujes timidos; +220 no subio). Default +450. Tope +640")
-    ap.add_argument("--climb-secs", dest="climb_secs", type=float, default=8.0,
+    ap.add_argument("--climb-secs", dest="climb_secs", type=float, default=10.0,
                     help="segundos que se SOSTIENE el throttle arriba (tras estabilizar el "
-                         "auto-despegue). El ascenso del Neo es lento -> min 8s")
-    ap.add_argument("--climb-max", dest="climb_max", type=float, default=16.0,
+                         "auto-despegue). Para 2m el ascenso lento del Neo necesita ~10s")
+    ap.add_argument("--climb-max", dest="climb_max", type=float, default=20.0,
                     help="backstop: si nunca estabiliza la altura, procede al patron a los N s")
     ap.add_argument("--cam-pitch", dest="cam_pitch", type=float, default=-45.0,
-                    help="angulo de camara en grados: 0=frente, negativo=abajo. -45=piso+muebles "
-                         "(recomendado para mapear), -90=recto al piso")
+                    help="angulo de PARKING de la camara (deg) antes del mapeo/al aterrizar; "
+                         "0=frente, negativo=abajo. En mapeo NO se usa: ahi la camara BARRE")
+    ap.add_argument("--gimbal-lo", dest="gimbal_lo", type=float, default=GIMBAL_LO_DEF,
+                    help="angulo INFERIOR del barrido de camara (deg). Default -75 (hacia el suelo). "
+                         "Tope fisico -90")
+    ap.add_argument("--gimbal-hi", dest="gimbal_hi", type=float, default=GIMBAL_HI_DEF,
+                    help="angulo SUPERIOR del barrido (deg). Default 0 (horizonte). Tope fisico +60. "
+                         "Sube (p.ej. +20) para incluir la parte alta de las paredes")
+    ap.add_argument("--gimbal-rate", dest="gimbal_rate", type=float, default=GIMBAL_RATE_DEF,
+                    help="velocidad del barrido de camara (deg/s). Default 12 (suave); fondo "
+                         "fisico 26.2. Mas lento = video mas nitido, mas rapido = mas cobertura/s")
     ap.add_argument("--out", default="map_video.h265", help="archivo de video de salida")
     ap.add_argument("--decode", metavar="FILE", default=None, help="decodificar un .h265 (usa el .venv)")
     args = ap.parse_args()
